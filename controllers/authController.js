@@ -16,7 +16,7 @@ const generateWelcomeEmail = (userEmail) => {
         <h2>Welcome to Maluk!</h2>
         <p>Dear Customer,</p>
         <p>Thank you for joining Maluk! We're excited to have you on board. Start exploring our wide range of products and enjoy exclusive offers.</p>
-        <p><a href="http://localhost:3000/login" style="color: #1a73e8; text-decoration: none;">Log in now</a> to get started.</p>
+        <p><a href="https://malukforever.com/login" style="color: #1a73e8; text-decoration: none;">Log in now</a> to get started.</p>
         <p>If you have any questions, feel free to contact us at <a href="mailto:${process.env.EMAIL_USER}" style="color: #1a73e8; text-decoration: none;">${process.env.EMAIL_USER}</a>.</p>
         <p>Best regards,<br/>The Maluk Team</p>
       </div>
@@ -25,7 +25,7 @@ const generateWelcomeEmail = (userEmail) => {
 };
 
 const generateResetPasswordEmail = (userEmail, resetToken) => {
-  const resetLink = `http://localhost:3000/reset-password?token=${resetToken}`;
+  const resetLink = `https://malukforever.com/reset-password?token=${resetToken}`;
   return {
     from: `"Maluk Team" <${process.env.EMAIL_USER}>`,
     to: userEmail,
@@ -52,7 +52,7 @@ const generatePasswordResetSuccessEmail = (userEmail) => {
         <h2>Password Reset Successful</h2>
         <p>Dear Customer,</p>
         <p>Your password has been successfully reset. You can now log in with your new password.</p>
-        <p><a href="http://localhost:3000/login" style="color: #1a73e8; text-decoration: none;">Log in here</a></p>
+        <p><a href="http:/https://malukforever.com/login" style="color: #1a73e8; text-decoration: none;">Log in here</a></p>
         <p>If you didn’t make this change, please contact us immediately at <a href="mailto:${process.env.EMAIL_USER}" style="color: #1a73e8; text-decoration: none;">${process.env.EMAIL_USER}</a>.</p>
         <p>Best regards,<br/>The Maluk Team</p>
       </div>

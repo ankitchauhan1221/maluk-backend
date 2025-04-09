@@ -82,7 +82,7 @@ const sendOrderConfirmationEmail = async (orderId, recipientEmail, totalAmount, 
               <table border="0" cellpadding="0" cellspacing="0" align="center">
                 <tr>
                   <td bgcolor="#1a73e8" style="border-radius: 5px;">
-                    <a href="http://localhost:3000/my-account" style="display: inline-block; padding: 12px 24px; color: #ffffff; text-decoration: none; font-size: 16px; font-weight: bold;">View My Account</a>
+                    <a href="https://malukforever.com/my-account" style="display: inline-block; padding: 12px 24px; color: #ffffff; text-decoration: none; font-size: 16px; font-weight: bold;">View My Account</a>
                   </td>
                 </tr>
               </table>
