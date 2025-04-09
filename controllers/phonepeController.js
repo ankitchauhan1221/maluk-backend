@@ -1,12 +1,12 @@
 const axios = require("axios");
 const Order = require("../models/Order");
 const { bookShipment } = require("./shippingController");
-const transporter = require("../config/nodemailer");
+const { sendOrderConfirmationEmail } = require("../service/emailService");
 
-const PHONEPE_MERCHANT_ID = "TESTVVUAT";
-const PHONEPE_CLIENT_ID = "TESTVVUAT_2502041721357207510164";
-const PHONEPE_CLIENT_SECRET = "ZTcxNDQyZjUtZjQ3Mi00MjJmLTgzOWYtMWZmZWQ2ZjdkMzVi";
-const PHONEPE_API_URL = "https://api-preprod.phonepe.com/apis/pg-sandbox";
+const PHONEPE_MERCHANT_ID = process.env.PHONEPE_MERCHANT_ID || "TESTVVUAT";
+const PHONEPE_CLIENT_ID = process.env.PHONEPE_CLIENT_ID || "TESTVVUAT_2502041721357207510164";
+const PHONEPE_CLIENT_SECRET = process.env.PHONEPE_CLIENT_SECRET || "ZTcxNDQyZjUtZjQ3Mi00MjJmLTgzOWYtMWZmZWQ2ZjdkMzVi";
+const PHONEPE_API_URL = process.env.PHONEPE_API_URL || "https://api-preprod.phonepe.com/apis/pg-sandbox";
 
 let authToken = null;
 let tokenExpiresAt = null;
@@ -41,6 +41,14 @@ async function ensureValidToken() {
   return authToken;
 }
 
+async function generateNumericOrderId() {
+  const year = new Date().getFullYear().toString().slice(-2); // e.g., "25" for 2025
+  const lastOrder = await Order.findOne({ orderId: { $regex: `^${year}` } }).sort({ orderId: -1 });
+  let nextNumber = lastOrder ? parseInt(lastOrder.orderId.slice(2)) + 1 : 1;
+  const sequence = nextNumber.toString().padStart(5, "0"); // 5-digit sequence
+  return `${year}${sequence}`; // e.g., "2500001"
+}
+
 exports.initiatePhonePePayment = async (req, res) => {
   console.log("Route - Entering initiate-payment");
   console.log("PhonePe - Request Body:", JSON.stringify(req.body, null, 2));
@@ -58,7 +66,7 @@ exports.initiatePhonePePayment = async (req, res) => {
     totalAmount,
     shippingCost,
     couponCode,
-    discountAmount,
+    discountAmount = 0, // Default to 0 if not provided
     orgPincode,
     desPincode,
     consignments,
@@ -72,13 +80,22 @@ exports.initiatePhonePePayment = async (req, res) => {
     return res.status(400).json({ success: false, error: "Products array is required" });
   }
 
+  if (typeof totalAmount !== "number" || typeof shippingCost !== "number" || typeof discountAmount !== "number") {
+    console.log("PhonePe - Validation failed: Invalid numeric values");
+    return res.status(400).json({ success: false, error: "Total amount, shipping cost, and discount must be numbers" });
+  }
+
   try {
-    const lastOrder = await Order.findOne().sort({ createdAt: -1 });
-    const nextNumber = lastOrder ? parseInt(lastOrder.orderId.replace(/^(TEMP|ORD)/, "")) + 1 : 1;
-    const tempOrderId = `TEMP${nextNumber.toString().padStart(6, "0")}`;
+    const orderId = await generateNumericOrderId(); // 7-digit numeric ID (e.g., "2500001")
+    const payableAmount = Math.max(0, totalAmount + shippingCost - discountAmount); // Calculate discounted amount
+
+    if (payableAmount < 1) {
+      console.log("PhonePe - Validation failed: Payable amount too low");
+      return res.status(400).json({ success: false, error: "Payable amount must be at least ₹1" });
+    }
 
     const order = new Order({
-      orderId: tempOrderId,
+      orderId,
       customer: customerId,
       products,
       totalAmount,
@@ -91,20 +108,21 @@ exports.initiatePhonePePayment = async (req, res) => {
       status: "Pending Payment",
       paymentStatus: "Initiated",
       consignments: consignments || [],
+      payableAmount, // Store payableAmount in the order
     });
 
     await order.save();
-    console.log(`Order - Temporary order stored with orderId: ${tempOrderId}`);
+    console.log(`Order - Order stored with orderId: ${orderId}, Payable Amount: ${payableAmount}`);
 
     const payload = {
-      merchantOrderId: tempOrderId,
-      amount: Math.round((totalAmount + shippingCost) * 100),
+      merchantOrderId: orderId,
+      amount: Math.round(payableAmount * 100), // Use discounted amount in paise
       expireAfter: 1200,
       paymentFlow: {
         type: "PG_CHECKOUT",
         message: "Payment for order",
         merchantUrls: {
-          redirectUrl: `${process.env.BACKEND_URL}/api/phonepe/verify-phonepe?orderId=${tempOrderId}`,
+          redirectUrl: `${process.env.BACKEND_URL}/api/phonepe/verify-phonepe?orderId=${orderId}`,
         },
       },
     };
@@ -116,16 +134,21 @@ exports.initiatePhonePePayment = async (req, res) => {
       Authorization: `O-Bearer ${authToken}`,
     };
 
+    console.log("PhonePe - Sending payload to PhonePe:", JSON.stringify(payload, null, 2));
     const response = await axios.post(url, payload, { headers });
     console.log("PhonePe - API Response:", JSON.stringify(response.data, null, 2));
 
     if (response.status === 200 && response.data.redirectUrl) {
       console.log("PhonePe - Payment URL generated:", response.data.redirectUrl);
-      return res.json({ success: true, orderId: tempOrderId, paymentUrl: response.data.redirectUrl });
+      return res.json({ success: true, orderId, paymentUrl: response.data.redirectUrl });
     }
     throw new Error("Payment initiation failed: No redirect URL in response");
   } catch (error) {
     console.error("PhonePe - Error initiating payment:", error.message);
+    if (error.response?.status === 400) {
+      console.error("PhonePe - Bad Request Details:", error.response.data);
+      return res.status(400).json({ success: false, error: error.response.data.message || "Bad request to PhonePe API" });
+    }
     return res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -147,7 +170,7 @@ exports.verifyPhonePePayment = async (orderId) => {
       success: response.data.state === "COMPLETED",
       state: response.data.state,
       transactionId: transactionId,
-      amount: response.data.amount / 100,
+      amount: response.data.amount / 100, // Convert back to rupees
     };
   } catch (error) {
     console.error("PhonePe - Error verifying payment:", error.message);
@@ -165,66 +188,57 @@ exports.verifyPhonePePaymentCallback = async (req, res) => {
   }
 
   try {
-    const tempOrder = await Order.findOne({ orderId });
-    if (!tempOrder) {
+    const order = await Order.findOne({ orderId });
+    if (!order) {
       console.log("PhonePe - Callback failed: Order not found for orderId:", orderId);
       return res.redirect(`${process.env.FRONTEND_URL}/order-failure?orderId=${orderId}&error=OrderNotFound`);
     }
 
     const paymentVerified = await exports.verifyPhonePePayment(orderId);
+    const payableAmount = Math.max(0, order.totalAmount + order.shippingCost - (order.discountAmount || 0));
 
     if (paymentVerified.success && paymentVerified.state === "COMPLETED") {
-      let finalOrderId = tempOrder.orderId.replace("TEMP", "ORD");
-      EXISTING_ORDER_CHECK: {
-        const existingOrder = await Order.findOne({ orderId: finalOrderId });
-        if (existingOrder) {
-          const orderCount = await Order.countDocuments();
-          finalOrderId = `ORD${(orderCount + 1).toString().padStart(6, "0")}`;
-        }
-      }
+      order.status = "Processing";
+      order.paymentStatus = "Paid";
+      order.transactionId = paymentVerified.transactionId;
+      await order.save();
+      console.log(`PhonePe - Order updated: ${orderId}, Status: ${order.status}, PaymentStatus: ${order.paymentStatus}`);
 
-      tempOrder.orderId = finalOrderId;
-      tempOrder.status = "Processing"; // Initial status after payment
-      tempOrder.paymentStatus = "Paid";
-      tempOrder.transactionId = paymentVerified.transactionId;
-      await tempOrder.save();
-      console.log(`PhonePe - Order updated: ${finalOrderId}, Status: ${tempOrder.status}, PaymentStatus: ${tempOrder.paymentStatus}`);
-
-      // Attempt shipment booking but don't change status to "Shipped" here
       try {
-        const { trackingNumber } = await bookShipment(finalOrderId, tempOrder);
-        tempOrder.trackingNumber = trackingNumber;
-        await tempOrder.save();
-        console.log(`PhonePe - Shipment booked for order: ${finalOrderId}, Tracking: ${trackingNumber}`);
+        const { trackingNumber } = await bookShipment(orderId, order);
+        order.trackingNumber = trackingNumber;
+        await order.save();
+        console.log(`PhonePe - Shipment booked for order: ${orderId}, Tracking: ${trackingNumber}`);
       } catch (shipmentError) {
         console.error("PhonePe - Shipment booking failed:", shipmentError.message);
       }
 
-      const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: tempOrder.shippingAddress.email,
-        subject: "Order Confirmation - MalukForever",
-        text: `Order ${finalOrderId} placed successfully. Transaction ID: ${paymentVerified.transactionId}`,
-        html: `<p>Order ${finalOrderId} placed successfully for ₹${tempOrder.totalAmount}. Shipping cost: ₹${tempOrder.shippingCost}. Status: ${tempOrder.status}. Transaction ID: ${paymentVerified.transactionId}. ${tempOrder.trackingNumber ? `Tracking: ${tempOrder.trackingNumber}` : 'Shipment pending.'}</p>`,
-      };
-      await transporter.sendMail(mailOptions).catch((emailError) => {
+      await sendOrderConfirmationEmail(
+        orderId,
+        order.shippingAddress.email,
+        order.totalAmount,
+        order.shippingCost,
+        order.trackingNumber,
+        paymentVerified.transactionId,
+        payableAmount
+      ).catch((emailError) => {
         console.error("PhonePe - Failed to send confirmation email:", emailError.message);
       });
 
-      const redirectUrl = `${process.env.FRONTEND_URL}/order-confirmation?orderId=${finalOrderId}&transactionId=${paymentVerified.transactionId}&status=${tempOrder.status.toLowerCase()}`;
+      const redirectUrl = `${process.env.FRONTEND_URL}/order-confirmation?orderId=${orderId}&transactionId=${paymentVerified.transactionId}&status=${order.status.toLowerCase()}`;
       console.log(`PhonePe - Redirecting to: ${redirectUrl}`);
       return res.redirect(redirectUrl);
     } else if (paymentVerified.state === "FAILED") {
-      tempOrder.status = "Failed";
-      tempOrder.paymentStatus = "Failed";
-      await tempOrder.save();
-      console.log(`PhonePe - Order marked as failed: ${orderId}, PaymentStatus: ${tempOrder.paymentStatus}`);
-      return res.redirect(`${process.env.FRONTEND_URL}/order-failure?orderId=${orderId}&error=PaymentFailed®ion=${encodeURIComponent(tempOrder.shippingAddress.state)}`);
+      order.status = "Failed";
+      order.paymentStatus = "Failed";
+      await order.save();
+      console.log(`PhonePe - Order marked as failed: ${orderId}, PaymentStatus: ${order.paymentStatus}`);
+      return res.redirect(`${process.env.FRONTEND_URL}/order-failure?orderId=${orderId}&error=PaymentFailed®ion=${encodeURIComponent(order.shippingAddress.state)}`);
     } else {
-      tempOrder.status = "Pending";
-      tempOrder.paymentStatus = "Pending";
-      await tempOrder.save();
-      console.log(`PhonePe - Order remains pending: ${orderId}, PaymentStatus: ${tempOrder.paymentStatus}`);
+      order.status = "Pending";
+      order.paymentStatus = "Pending";
+      await order.save();
+      console.log(`PhonePe - Order remains pending: ${orderId}, PaymentStatus: ${order.paymentStatus}`);
       return res.redirect(`${process.env.FRONTEND_URL}/checkout?orderId=${orderId}&status=pending`);
     }
   } catch (error) {
@@ -248,24 +262,35 @@ exports.checkPaymentStatus = async (req, res) => {
     }
 
     const paymentVerified = await exports.verifyPhonePePayment(orderId);
+    const payableAmount = Math.max(0, order.totalAmount + order.shippingCost - (order.discountAmount || 0));
 
     if (paymentVerified.success && paymentVerified.state === "COMPLETED") {
-      const finalOrderId = order.orderId.replace("TEMP", "ORD");
-      order.orderId = finalOrderId;
-      order.status = "Processing"; // Keep as Processing, not Shipped
+      order.status = "Processing";
       order.paymentStatus = "Paid";
       order.transactionId = paymentVerified.transactionId;
 
-      if (!order.trackingNumber) { // Only book if not already booked
-        const { trackingNumber } = await bookShipment(finalOrderId, order);
+      if (!order.trackingNumber) {
+        const { trackingNumber } = await bookShipment(orderId, order);
         order.trackingNumber = trackingNumber;
       }
       await order.save();
 
+      await sendOrderConfirmationEmail(
+        orderId,
+        order.shippingAddress.email,
+        order.totalAmount,
+        order.shippingCost,
+        order.trackingNumber,
+        paymentVerified.transactionId,
+        payableAmount
+      ).catch((emailError) => {
+        console.error("PhonePe - Failed to send confirmation email in checkPaymentStatus:", emailError.message);
+      });
+
       return res.json({
         success: true,
         status: "success",
-        orderId: finalOrderId,
+        orderId,
         transactionId: paymentVerified.transactionId,
         trackingNumber: order.trackingNumber,
       });

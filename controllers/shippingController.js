@@ -32,7 +32,8 @@ const bookShipment = async (orderId, order) => {
       weight: 0.5,
       pieceCount: 1,
     }];
-    const sharedReferenceNumber = `${orderId}-1`;
+    const sharedReferenceNumber = orderId;
+    const payableAmount = Math.max(0, order.totalAmount + order.shippingCost - (order.discountAmount || 0));
 
     const formattedConsignments = consignments.map((consignment) => ({
       customer_code: SHIPSY_CUSTOMER_CODE,
@@ -45,7 +46,7 @@ const bookShipment = async (orderId, order) => {
       height: consignment.height || "10.0",
       weight_unit: "kg",
       weight: consignment.weight || "0.5",
-      declared_value: (order.totalAmount + order.shippingCost).toString(),
+      declared_value: payableAmount.toString(), // Use discounted amount
       eway_bill: "",
       invoice_number: orderId,
       invoice_date: new Date().toISOString().split("T")[0],
@@ -84,10 +85,10 @@ const bookShipment = async (orderId, order) => {
       },
       customer_reference_number: sharedReferenceNumber,
       cod_collection_mode: isCOD ? "CASH" : "",
-      cod_amount: isCOD ? (order.totalAmount + order.shippingCost).toString() : "0",
+      cod_amount: isCOD ? payableAmount.toString() : "0", // Use discounted amount for COD
       commodity_id: "2",
       description: order.products.map((p) => p.name).join(", ") || "Anti-Dandruff Shampoo",
-      reference_number: "", // This will be set by Shipsy
+      reference_number: "",
     }));
 
     const payload = { consignments: formattedConsignments };
@@ -118,7 +119,7 @@ const bookShipment = async (orderId, order) => {
       remarks: "Shipment booked with Shipsy",
     });
     order.status = "Processing";
-    order.reference_number = trackingNumber; // Save Shipsy reference number here
+    order.reference_number = trackingNumber;
 
     await order.save();
 
@@ -130,6 +131,8 @@ const bookShipment = async (orderId, order) => {
     throw error;
   }
 };
+
+module.exports = { bookShipment };
 
 
 

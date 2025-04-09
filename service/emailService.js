@@ -2,10 +2,12 @@ const nodemailer = require('nodemailer');
 const transporter = require("../config/nodemailer"); // Your nodemailer config
 require('dotenv').config();
 
-const sendOrderConfirmationEmail = async (orderId, recipientEmail, totalAmount, shippingCost, trackingNumber, transactionId = null) => {
+const sendOrderConfirmationEmail = async (orderId, recipientEmail, totalAmount, shippingCost, trackingNumber, transactionId = null, payableAmount) => {
+  const discount = totalAmount + shippingCost - payableAmount; // Calculate discount if any
   const mailOptions = {
     from: `"MalukForever" <${process.env.EMAIL_USER}>`,
     to: recipientEmail,
+    replyTo: process.env.EMAIL_USER,
     subject: `Order #${orderId} Confirmed - Thank You for Shopping with MalukForever!`,
     html: `
       <!DOCTYPE html>
@@ -29,7 +31,7 @@ const sendOrderConfirmationEmail = async (orderId, recipientEmail, totalAmount, 
             <td style="padding: 30px;">
               <h2 style="font-size: 20px; margin: 0 0 15px; color: #1a73e8;">Hello Valued Customer,</h2>
               <p style="font-size: 16px; line-height: 1.5; margin: 0 0 20px;">
-                Your order has been successfully confirmed${transactionId ? ' and paid via PhonePe' : ''}. We’re preparing your items for shipment, and you’ll receive them soon!
+                Your order has been successfully confirmed${transactionId ? ' and paid via PhonePe' : ' with Cash on Delivery'}. We’re preparing your items for shipment, and you’ll receive them soon!
               </p>
               
               <!-- Order Details -->
@@ -47,12 +49,23 @@ const sendOrderConfirmationEmail = async (orderId, recipientEmail, totalAmount, 
                 </tr>` : ''}
                 <tr>
                   <td style="font-size: 16px; padding-bottom: 10px;">
-                    <strong>Total Amount:</strong> ₹${totalAmount.toFixed(2)}
+                    <strong>Subtotal:</strong> ₹${totalAmount.toFixed(2)}
                   </td>
                 </tr>
                 <tr>
                   <td style="font-size: 16px; padding-bottom: 10px;">
                     <strong>Shipping Cost:</strong> ${shippingCost > 0 ? `₹${shippingCost.toFixed(2)}` : 'Free'}
+                  </td>
+                </tr>
+                ${discount > 0 ? `
+                <tr>
+                  <td style="font-size: 16px; padding-bottom: 10px;">
+                    <strong>Discount:</strong> -₹${discount.toFixed(2)}
+                  </td>
+                </tr>` : ''}
+                <tr>
+                  <td style="font-size: 16px; padding-bottom: 10px;">
+                    <strong>${transactionId ? 'Amount Paid' : 'Amount Payable on Delivery'}:</strong> ₹${payableAmount.toFixed(2)}
                   </td>
                 </tr>
                 <tr>
@@ -90,7 +103,7 @@ const sendOrderConfirmationEmail = async (orderId, recipientEmail, totalAmount, 
 
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`Order confirmation email sent to ${recipientEmail} for order #${orderId}${transactionId ? ` with transaction ID ${transactionId}` : ''}`);
+    console.log(`Order confirmation email sent to ${recipientEmail} for order #${orderId}${transactionId ? ` with transaction ID ${transactionId}` : ''}, payable amount: ₹${payableAmount}`);
   } catch (error) {
     console.error('Error sending order confirmation email:', error);
     throw error;

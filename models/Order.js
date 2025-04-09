@@ -25,10 +25,11 @@ const orderSchema = new mongoose.Schema({
       thumbnail: { type: String },
     },
   ],
-  totalAmount: { type: Number, required: true },
+  totalAmount: { type: Number, required: true }, // Subtotal before shipping and discount
   shippingCost: { type: Number, default: 0 },
   couponCode: { type: String, default: null },
   discountAmount: { type: Number, default: 0 },
+  payableAmount: { type: Number, required: true, default: 0 }, // Final amount after discount (totalAmount + shippingCost - discountAmount)
   status: {
     type: String,
     enum: [

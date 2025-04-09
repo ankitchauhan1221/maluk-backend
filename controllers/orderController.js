@@ -13,14 +13,15 @@ const client = redis.createClient({ url: process.env.REDIS_URL });
 client.connect().catch((err) => console.error("Redis connection error:", err));
 
 const getNextOrderId = async () => {
+  const year = new Date().getFullYear().toString().slice(-2); // e.g., "25" for 2025
   const sequence = await Sequence.findOneAndUpdate(
-    { name: "orderId" },
+    { name: `orderId_${year}` },
     { $inc: { value: 1 } },
     { upsert: true, new: true }
   );
-  return `ORD${sequence.value.toString().padStart(2, "0")}`;
+  const sequenceNumber = sequence.value.toString().padStart(5, "0"); // e.g., "00001"
+  return `${year}${sequenceNumber}`; // e.g., "2500001"
 };
-
 
 exports.createOrder = async (req, res) => {
   const {
@@ -31,7 +32,7 @@ exports.createOrder = async (req, res) => {
     totalAmount,
     shippingCost,
     couponCode,
-    discountAmount,
+    discountAmount = 0, // Default to 0 if not provided
     saveAddress,
   } = req.body;
   const customerId = req.user?.id;
@@ -45,7 +46,16 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({ success: false, error: "Invalid payment method" });
     }
 
+    if (typeof totalAmount !== "number" || typeof shippingCost !== "number" || typeof discountAmount !== "number") {
+      return res.status(400).json({ success: false, error: "Total amount, shipping cost, and discount must be numbers" });
+    }
+
     const orderId = await getNextOrderId();
+    const payableAmount = Math.max(0, totalAmount + shippingCost - discountAmount); // Calculate discounted amount
+
+    if (payableAmount < 1) {
+      return res.status(400).json({ success: false, error: "Payable amount must be at least ₹1" });
+    }
 
     if (paymentMethod === "PhonePe") {
       const tempOrderId = `TEMP${Date.now()}`;
@@ -56,19 +66,38 @@ exports.createOrder = async (req, res) => {
         totalAmount,
         shippingCost,
         couponCode: couponCode || null,
-        discountAmount: discountAmount || 0,
+        discountAmount,
         shippingAddress,
         billingAddress: billingAddress || shippingAddress,
         paymentMethod,
         saveAddress,
       };
       await client.set(tempOrderId, JSON.stringify(orderData), { EX: 3600 });
-      const paymentUrl = await initiatePhonePePayment({
-        tempOrderId,
-        amount: totalAmount + shippingCost,
-        customerId,
+      const phonePeRequestBody = {
+        products,
+        shippingAddress,
+        billingAddress,
+        totalAmount,
+        shippingCost,
+        couponCode,
+        discountAmount,
+        orgPincode: req.body.orgPincode,
+        desPincode: req.body.desPincode,
+        consignments: req.body.consignments,
+        paymentMethod,
+        saveAddress,
+      };
+      const response = await fetch(`${process.env.BACKEND_URL}/api/phonepe/initiate-payment`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${req.user.token}`, // Assuming token is available
+        },
+        body: JSON.stringify(phonePeRequestBody),
       });
-      return res.status(200).json({ success: true, tempOrderId, paymentUrl });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Failed to initiate PhonePe payment");
+      return res.status(200).json({ success: true, tempOrderId, paymentUrl: result.paymentUrl });
     }
 
     if (paymentMethod === "COD") {
@@ -79,25 +108,24 @@ exports.createOrder = async (req, res) => {
         totalAmount,
         shippingCost,
         couponCode: couponCode || null,
-        discountAmount: discountAmount || 0,
+        discountAmount,
         shippingAddress,
         billingAddress: billingAddress || shippingAddress,
         paymentMethod,
         status: "Pending",
         paymentStatus: "Pending",
         trackingUpdates: [],
+        payableAmount, // Store payableAmount in the order for reference
       });
 
       await order.save();
       const { trackingNumber } = await bookShipment(orderId, order);
-
-      // Send email for COD order (no transactionId)
-      await sendOrderConfirmationEmail(orderId, shippingAddress.email, totalAmount, shippingCost, trackingNumber);
-
+      await sendOrderConfirmationEmail(orderId, shippingAddress.email, totalAmount, shippingCost, trackingNumber, null, payableAmount);
       return res.status(201).json({
         success: true,
         orderId,
         trackingNumber,
+        payableAmount,
         message: "Order placed and shipment booked successfully",
       });
     }
@@ -106,122 +134,6 @@ exports.createOrder = async (req, res) => {
     return res.status(500).json({ success: false, error: "Failed to create order", details: error.message });
   }
 };
-
-// exports.confirmOrder = async (req, res) => {
-//   try {
-//     const { tempOrderId, transactionId } = req.body;
-//     const customerId = req.user?.id;
-
-//     console.log('ConfirmOrder - tempOrderId:', tempOrderId);
-//     console.log('ConfirmOrder - transactionId:', transactionId);
-//     console.log('ConfirmOrder - customerId:', customerId);
-
-//     if (!tempOrderId || !transactionId) {
-//       return res.status(400).json({ error: 'Invalid request data' });
-//     }
-
-//     const tempOrderData = await client.get(tempOrderId);
-//     if (!tempOrderData) {
-//       return res.status(404).json({ error: 'Temporary order not found or expired' });
-//     }
-
-//     const orderData = JSON.parse(tempOrderData);
-//     console.log('ConfirmOrder - Order data from Redis:', orderData);
-
-//     if (orderData.customerId !== customerId) {
-//       return res.status(403).json({ error: 'Unauthorized' });
-//     }
-
-//     const paymentStatus = await verifyPhonePePayment(tempOrderId, transactionId);
-//     console.log('ConfirmOrder - Payment Status:', paymentStatus);
-//     if (paymentStatus.code !== 'PAYMENT_SUCCESS') {
-//       return res.status(400).json({ error: 'Payment verification failed' });
-//     }
-
-//     let order = await Order.findOne({ orderId: orderData.orderId });
-//     if (order) {
-//       console.log('ConfirmOrder - Order already exists:', order);
-//       if (order.paymentStatus === 'Paid' && order.transactionId === transactionId) {
-//         const { trackingNumber } = await bookShipment(order.orderId, order);
-//         await client.del(tempOrderId);
-//         return res.status(200).json({
-//           success: true,
-//           orderId: order.orderId,
-//           trackingNumber,
-//           message: 'Order already confirmed and shipment booked',
-//         });
-//       }
-//       return res.status(409).json({ error: 'Order exists but payment status mismatch' });
-//     }
-
-//     order = new Order({
-//       orderId: orderData.orderId,
-//       customer: customerId,
-//       products: orderData.products,
-//       totalAmount: orderData.totalAmount,
-//       shippingCost: orderData.shippingCost,
-//       couponCode: orderData.couponCode || null,
-//       discountAmount: orderData.discountAmount,
-//       shippingAddress: orderData.shippingAddress,
-//       billingAddress: orderData.billingAddress || orderData.shippingAddress,
-//       paymentMethod: orderData.paymentMethod,
-//       status: 'Pending',
-//       paymentStatus: 'Paid',
-//       transactionId,
-//       trackingUpdates: [],
-//     });
-
-//     await order.save();
-//     console.log('ConfirmOrder - Order saved:', order);
-
-//     if (orderData.couponCode && orderData.discountAmount > 0) {
-//       await incrementCouponUsage(orderData.couponCode);
-//     }
-
-//     if (orderData.saveAddress) {
-//       const user = await User.findById(customerId);
-//       if (user) {
-//         user.addresses = user.addresses || [];
-//         if (!user.addresses.some((addr) => addr.streetAddress === orderData.shippingAddress.streetAddress)) {
-//           user.addresses.push({ ...orderData.shippingAddress, type: 'Shipping' });
-//         }
-//         if (
-//           orderData.billingAddress &&
-//           !user.addresses.some((addr) => addr.streetAddress === orderData.billingAddress.streetAddress)
-//         ) {
-//           user.addresses.push({ ...orderData.billingAddress, type: 'Billing' });
-//         }
-//         await user.save();
-//       }
-//     }
-
-//     const { trackingNumber } = await bookShipment(order.orderId, order);
-
-//     // Send email with transactionId for PhonePe order
-//     await sendOrderConfirmationEmail(
-//       order.orderId,
-//       orderData.shippingAddress.email,
-//       orderData.totalAmount,
-//       orderData.shippingCost,
-//       trackingNumber,
-//       transactionId
-//     );
-
-//     await client.del(tempOrderId);
-//     return res.status(201).json({
-//       success: true,
-//       orderId: order.orderId,
-//       trackingNumber,
-//       message: 'Order confirmed and shipment booked',
-//     });
-//   } catch (err) {
-//     console.error('Order Confirmation - Error:', err.message);
-//     if (err.code === 11000) {
-//       return res.status(409).json({ error: 'Order already exists with this orderId' });
-//     }
-//     return res.status(500).json({ error: 'Failed to confirm order', details: err.message });
-//   }
-// };
 
 // Other functions remain unchanged
 exports.getOrderHistory = async (req, res) => {
