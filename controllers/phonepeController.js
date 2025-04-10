@@ -3,44 +3,14 @@ const Order = require("../models/Order");
 const { bookShipment } = require("./shippingController");
 const { sendOrderConfirmationEmail } = require("../service/emailService");
 
-const PHONEPE_MERCHANT_ID = process.env.PHONEPE_MERCHANT_ID || "TESTVVUAT";
-const PHONEPE_CLIENT_ID = process.env.PHONEPE_CLIENT_ID || "TESTVVUAT_2502041721357207510164";
-const PHONEPE_CLIENT_SECRET = process.env.PHONEPE_CLIENT_SECRET || "ZTcxNDQyZjUtZjQ3Mi00MjJmLTgzOWYtMWZmZWQ2ZjdkMzVi";
-const PHONEPE_API_URL = process.env.PHONEPE_API_URL || "https://api-preprod.phonepe.com/apis/pg-sandbox";
+// Environment variables (PROD only)
+const PHONEPE_CLIENT_ID = process.env.PHONEPE_CLIENT_ID;
+const PHONEPE_CLIENT_SECRET = process.env.PHONEPE_CLIENT_SECRET;
+const PHONEPE_CLIENT_VERSION = process.env.PHONEPE_CLIENT_VERSION; // Required for PROD, from credentials email
+const PHONEPE_API_URL = "https://api.phonepe.com/apis/identity-manager"; // PROD Auth URL
+const PHONEPE_PG_URL = "https://api.phonepe.com/apis/pg"; // PROD PG URL
 
-let authToken = null;
-let tokenExpiresAt = null;
-
-async function getAuthToken() {
-  try {
-    const url = `${PHONEPE_API_URL}/v1/oauth/token`;
-    const headers = { "Content-Type": "application/x-www-form-urlencoded" };
-    const payload = new URLSearchParams({
-      client_id: PHONEPE_CLIENT_ID,
-      client_version: "1",
-      client_secret: PHONEPE_CLIENT_SECRET,
-      grant_type: "client_credentials",
-    });
-
-    const response = await axios.post(url, payload, { headers });
-    authToken = response.data.access_token;
-    tokenExpiresAt = response.data.expires_at;
-    console.log("PhonePe - Auth Token Obtained:", authToken);
-    return authToken;
-  } catch (error) {
-    console.error("PhonePe - Error getting auth token:", error.message);
-    throw error;
-  }
-}
-
-async function ensureValidToken() {
-  const currentTime = Math.floor(Date.now() / 1000);
-  if (!authToken || currentTime >= tokenExpiresAt - 60) {
-    return await getAuthToken();
-  }
-  return authToken;
-}
-
+// Utility to generate numeric order ID
 async function generateNumericOrderId() {
   const year = new Date().getFullYear().toString().slice(-2); // e.g., "25" for 2025
   const lastOrder = await Order.findOne({ orderId: { $regex: `^${year}` } }).sort({ orderId: -1 });
@@ -49,50 +19,51 @@ async function generateNumericOrderId() {
   return `${year}${sequence}`; // e.g., "2500001"
 }
 
+// Fetch Auth Token (PROD)
+async function fetchAuthToken() {
+  const url = `${PHONEPE_API_URL}/v1/oauth/token`;
+  const params = new URLSearchParams({
+    client_id: PHONEPE_CLIENT_ID,
+    client_version: PHONEPE_CLIENT_VERSION, // Use the value from your credentials email
+    client_secret: PHONEPE_CLIENT_SECRET,
+    grant_type: "client_credentials",
+  });
+
+  try {
+    const response = await axios.post(url, params, {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    return {
+      accessToken: response.data.access_token,
+      expiresAt: response.data.expires_at,
+    };
+  } catch (error) {
+    console.error("PhonePe - Error fetching auth token:", error.message);
+    throw new Error("Failed to fetch auth token");
+  }
+}
+
 exports.initiatePhonePePayment = async (req, res) => {
-  console.log("Route - Entering initiate-payment");
-  console.log("PhonePe - Request Body:", JSON.stringify(req.body, null, 2));
-  console.log("PhonePe - req.user:", req.user);
+  console.log("Backend - Entering initiatePhonePePayment");
+  console.log("Backend - Request Body:", JSON.stringify(req.body, null, 2));
+  console.log("Backend - req.user:", req.user);
 
   if (!req.user || !req.user.id) {
-    console.log("PhonePe - Authentication failed: No user found in request");
+    console.log("Backend - Authentication failed: No user found");
     return res.status(401).json({ success: false, error: "User not authenticated" });
   }
 
-  const {
-    products,
-    shippingAddress,
-    billingAddress,
-    totalAmount,
-    shippingCost,
-    couponCode,
-    discountAmount = 0, // Default to 0 if not provided
-    orgPincode,
-    desPincode,
-    consignments,
-    paymentMethod,
-    saveAddress,
-  } = req.body;
+  const { products, shippingAddress, totalAmount, shippingCost, discountAmount = 0 } = req.body;
   const customerId = req.user.id;
 
   if (!products || !Array.isArray(products)) {
-    console.log("PhonePe - Validation failed: Products array is missing or invalid");
+    console.log("Backend - Validation failed: Products array missing or invalid");
     return res.status(400).json({ success: false, error: "Products array is required" });
   }
 
-  if (typeof totalAmount !== "number" || typeof shippingCost !== "number" || typeof discountAmount !== "number") {
-    console.log("PhonePe - Validation failed: Invalid numeric values");
-    return res.status(400).json({ success: false, error: "Total amount, shipping cost, and discount must be numbers" });
-  }
-
   try {
-    const orderId = await generateNumericOrderId(); // 7-digit numeric ID (e.g., "2500001")
-    const payableAmount = Math.max(0, totalAmount + shippingCost - discountAmount); // Calculate discounted amount
-
-    if (payableAmount < 1) {
-      console.log("PhonePe - Validation failed: Payable amount too low");
-      return res.status(400).json({ success: false, error: "Payable amount must be at least ₹1" });
-    }
+    const orderId = await generateNumericOrderId();
+    const payableAmount = Math.max(0, totalAmount + shippingCost - discountAmount);
 
     const order = new Order({
       orderId,
@@ -100,53 +71,52 @@ exports.initiatePhonePePayment = async (req, res) => {
       products,
       totalAmount,
       shippingCost,
-      couponCode: couponCode || null,
       discountAmount,
       shippingAddress,
-      billingAddress: billingAddress || shippingAddress,
-      paymentMethod: paymentMethod || "PhonePe",
+      billingAddress: shippingAddress,
+      paymentMethod: "PhonePe",
       status: "Pending Payment",
       paymentStatus: "Initiated",
-      consignments: consignments || [],
-      payableAmount, // Store payableAmount in the order
+      payableAmount,
     });
-
     await order.save();
-    console.log(`Order - Order stored with orderId: ${orderId}, Payable Amount: ${payableAmount}`);
+    console.log("Backend - Order saved:", orderId);
+
+    // Fetch auth token
+    const { accessToken } = await fetchAuthToken();
 
     const payload = {
       merchantOrderId: orderId,
-      amount: Math.round(payableAmount * 100), // Use discounted amount in paise
-      expireAfter: 1200,
+      amount: Math.round(payableAmount * 100), // In paise
+      expireAfter: 1200, // 20 minutes default
       paymentFlow: {
         type: "PG_CHECKOUT",
-        message: "Payment for order",
+        message: "Payment for order " + orderId,
         merchantUrls: {
           redirectUrl: `${process.env.BACKEND_URL}/api/phonepe/verify-phonepe?orderId=${orderId}`,
         },
       },
     };
 
-    await ensureValidToken();
-    const url = `${PHONEPE_API_URL}/checkout/v2/pay`;
-    const headers = {
-      "Content-Type": "application/json",
-      Authorization: `O-Bearer ${authToken}`,
-    };
+    const url = `${PHONEPE_PG_URL}/checkout/v2/pay`;
+    const response = await axios.post(url, payload, {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `O-Bearer ${accessToken}`,
+      },
+    });
 
-    console.log("PhonePe - Sending payload to PhonePe:", JSON.stringify(payload, null, 2));
-    const response = await axios.post(url, payload, { headers });
-    console.log("PhonePe - API Response:", JSON.stringify(response.data, null, 2));
+    console.log("Backend - PhonePe Response:", JSON.stringify(response.data, null, 2));
 
-    if (response.status === 200 && response.data.redirectUrl) {
-      console.log("PhonePe - Payment URL generated:", response.data.redirectUrl);
-      return res.json({ success: true, orderId, paymentUrl: response.data.redirectUrl });
+    const redirectUrl = response.data.redirectUrl;
+    if (redirectUrl) {
+      return res.status(200).json({ success: true, orderId, paymentUrl: redirectUrl });
     }
-    throw new Error("Payment initiation failed: No redirect URL in response");
+    throw new Error("No redirect URL received from PhonePe");
   } catch (error) {
-    console.error("PhonePe - Error initiating payment:", error.message);
-    if (error.response?.status === 400) {
-      console.error("PhonePe - Bad Request Details:", error.response.data);
+    console.error("Backend - Payment error:", error.message);
+    if (error.response) {
+      console.error("Backend - PhonePe Error Data:", JSON.stringify(error.response.data, null, 2));
       return res.status(400).json({ success: false, error: error.response.data.message || "Bad request to PhonePe API" });
     }
     return res.status(500).json({ success: false, error: error.message });
@@ -155,17 +125,19 @@ exports.initiatePhonePePayment = async (req, res) => {
 
 exports.verifyPhonePePayment = async (orderId) => {
   try {
-    await ensureValidToken();
-    const url = `${PHONEPE_API_URL}/checkout/v2/order/${orderId}/status?details=true`;
-    const headers = {
-      "Content-Type": "application/json",
-      Authorization: `O-Bearer ${authToken}`,
-    };
+    const { accessToken } = await fetchAuthToken();
+    const url = `${PHONEPE_PG_URL}/checkout/v2/order/${orderId}/status`;
 
-    const response = await axios.get(url, { headers });
+    const response = await axios.get(url, {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `O-Bearer ${accessToken}`,
+      },
+    });
+
     console.log("PhonePe - Payment Status Response:", JSON.stringify(response.data, null, 2));
 
-    const transactionId = response.data.paymentDetails?.[0]?.transactionId || response.data.orderId || orderId;
+    const transactionId = response.data.paymentDetails[0]?.transactionId || orderId;
     return {
       success: response.data.state === "COMPLETED",
       state: response.data.state,
