@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"destinationPincode":{"$numberInt":"1"}},"name":"destinationPincode_1","background":true,"unique":true}],"uuid":"1caadd87a909422cbbf63f2bca4d8964","collectionName":"shippingdetails","type":"collection"}
