@@ -13,6 +13,7 @@ const transporter = nodemailer.createTransport({
   auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
 });
 
+// Book a shipment with DTDC
 const bookShipment = async (orderId, order) => {
   try {
     if (!SHIPSY_BOOK_SHIPMENT_URL || !SHIPSY_API_KEY || !SHIPSY_CUSTOMER_CODE) {
@@ -46,7 +47,7 @@ const bookShipment = async (orderId, order) => {
       height: consignment.height || "10.0",
       weight_unit: "kg",
       weight: consignment.weight || "0.5",
-      declared_value: payableAmount.toString(), // Use discounted amount
+      declared_value: payableAmount.toString(),
       eway_bill: "",
       invoice_number: orderId,
       invoice_date: new Date().toISOString().split("T")[0],
@@ -62,9 +63,9 @@ const bookShipment = async (orderId, order) => {
         state: process.env.WAREHOUSE_STATE || "Uttar Pradesh",
       },
       destination_details: {
-        name: order.shippingAddress.name || "Unknown Customer",
-        phone: order.shippingAddress.phone || "+918368959586",
-        alternate_phone: order.shippingAddress.phone || "+918368959586",
+        name: order.shippingAddress.name || "MalukForever",
+        phone: order.shippingAddress.phone || "+9100000000",
+        alternate_phone: order.shippingAddress.phone || "+910000000000",
         address_line_1: order.shippingAddress.streetAddress || "Delhi India",
         address_line_2: order.shippingAddress.apartment || "",
         pincode: order.shippingAddress.zip || "110001",
@@ -85,7 +86,7 @@ const bookShipment = async (orderId, order) => {
       },
       customer_reference_number: sharedReferenceNumber,
       cod_collection_mode: isCOD ? "CASH" : "",
-      cod_amount: isCOD ? payableAmount.toString() : "0", // Use discounted amount for COD
+      cod_amount: isCOD ? payableAmount.toString() : "0",
       commodity_id: "2",
       description: order.products.map((p) => p.name).join(", ") || "Anti-Dandruff Shampoo",
       reference_number: "",
@@ -107,20 +108,9 @@ const bookShipment = async (orderId, order) => {
     }
 
     const trackingNumber = shipmentResult.reference_number || `Fallback-${orderId}-1`;
-    const now = new Date();
 
-    order.trackingUpdates.push({
-      action: "BKD",
-      actionDesc: "Booked",
-      trackingNumber,
-      actionDate: now.toISOString().split("T")[0].replace(/-/g, ""),
-      actionTime: now.toISOString().split("T")[1].split(".")[0].replace(/:/g, ""),
-      origin: process.env.WAREHOUSE_CITY || "Noida",
-      remarks: "Shipment booked with Shipsy",
-    });
     order.status = "Processing";
     order.reference_number = trackingNumber;
-
     await order.save();
 
     console.log(`✅ Shipping - Shipment booked for order ${orderId}`);
@@ -132,27 +122,48 @@ const bookShipment = async (orderId, order) => {
   }
 };
 
-module.exports = { bookShipment };
-
-
-
-// DTDC Tracking Update Endpoint
-exports.receiveTrackingUpdate = async (req, res) => {
+// Receive DTDC tracking updates
+const receiveTrackingUpdate = async (req, res) => {
   try {
     const { shipment, shipmentStatus } = req.body;
 
     if (!shipment?.strShipmentNo || !shipmentStatus || !Array.isArray(shipmentStatus)) {
+      console.error("Invalid webhook payload:", JSON.stringify(req.body, null, 2));
       return res.status(400).json({ success: false, error: "Invalid DTDC tracking data" });
     }
 
     const trackingNumber = shipment.strShipmentNo;
-    const order = await Order.findOne({ "trackingUpdates.trackingNumber": trackingNumber });
+    const order = await Order.findOne({ reference_number: trackingNumber });
     if (!order) {
       console.warn(`Order not found for tracking number: ${trackingNumber}`);
       return res.status(404).json({ success: false, error: "Order not found" });
     }
 
-    const newTrackingUpdates = shipmentStatus.map((status) => ({
+    const dtdcStatusMap = {
+      BKD: "Processing",
+      PCUP: "Shipped",
+      OUTDLV: "Out for Delivery",
+      DLV: "Delivered",
+      NONDLV: "Failed",
+      RTO: "Return to Origin",
+      RETURND: "Returned",
+      CAN: "Cancelled",
+    };
+
+    // Filter out BKD if already present to avoid duplicates
+    const filteredShipmentStatus = shipmentStatus.filter(
+      (status) => status.strAction !== "BKD" || order.trackingUpdates.every((update) => update.action !== "BKD")
+    );
+
+    if (filteredShipmentStatus.length === 0) {
+      console.warn(`No valid statuses after filtering for tracking number: ${trackingNumber}`, {
+        originalStatuses: shipmentStatus.map(s => s.strAction),
+        existingUpdates: order.trackingUpdates.map(u => u.action),
+      });
+      return res.status(200).json({ success: true, message: "No new valid tracking updates to process" });
+    }
+
+    const newTrackingUpdates = filteredShipmentStatus.map((status) => ({
       action: status.strAction,
       actionDesc: status.strActionDesc,
       origin: status.strOrigin,
@@ -169,64 +180,53 @@ exports.receiveTrackingUpdate = async (req, res) => {
 
     order.trackingUpdates = order.trackingUpdates.concat(newTrackingUpdates);
 
-    const latestStatus = shipmentStatus[shipmentStatus.length - 1];
-    const dtdcStatusMap = {
-      "BKD": "Processing",          // Booked
-      "MNF": "Processing",          // Manifested
-      "PU": "Shipped",             // Picked Up
-      "OFD": "Out for Delivery",   // Out for Delivery
-      "DLV": "Delivered",          // Delivered
-      "NONDLV": "Failed",          // Not Delivered
-      "RTO": "Return to Origin",   // Return to Origin
-      "RTD": "Returned",           // Return Delivered
-      "CAN": "Cancelled",          // Cancelled
-      // "IT" deliberately omitted to ignore "In Transit"
-    };
-
+    // Update order status for non-BKD statuses
+    const latestStatus = filteredShipmentStatus[filteredShipmentStatus.length - 1];
     const mappedStatus = dtdcStatusMap[latestStatus.strAction];
-    if (mappedStatus) {
+    if (mappedStatus && mappedStatus !== "Processing") {
       order.status = mappedStatus;
-    } // Else, keep the previous status (ignores "IT")
+    } else if (!mappedStatus) {
+      console.warn(`Unmapped DTDC status: ${latestStatus.strAction} for tracking number: ${trackingNumber}`);
+    }
 
-    // Update DTDC-specific fields
     order.weight = shipment.strWeight || order.weight;
     order.rtoNumber = shipment.strRtoNumber || order.rtoNumber;
-    order.expectedDeliveryDate = shipment.strExpectedDeliveryDate || order.expectedDeliveryDate;
-    order.revExpectedDeliveryDate = shipment.strRevExpectedDeliveryDate || order.revExpectedDeliveryDate;
+    order.expectedDeliveryDate = shipment.strExpectedDeliveryDate
+      ? new Date(shipment.strExpectedDeliveryDate.split(/(..)(..)(....)/).slice(1, 4).reverse().join('-'))
+      : order.expectedDeliveryDate;
+    order.revExpectedDeliveryDate = shipment.strRevExpectedDeliveryDate
+      ? new Date(shipment.strRevExpectedDeliveryDate.split(/(..)(..)(....)/).slice(1, 4).reverse().join('-'))
+      : order.revExpectedDeliveryDate;
 
+    // Handle delivery email
     if (order.status === "Delivered") {
-      if (order.paymentMethod === "COD") {
-        order.paymentStatus = "Paid";
-        const mailOptions = {
-          from: process.env.EMAIL_USER,
-          to: order.shippingAddress.email,
-          subject: "Order Delivered - MalukForever",
-          text: `Your order ${order.orderId} was delivered on ${latestStatus.strActionDate} at ${latestStatus.strActionTime}.\nPayment Method: COD\nPayment Status: Paid`,
-        };
+      order.paymentStatus = "Paid";
+      const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: order.shippingAddress.email,
+        subject: "Order Delivered - MalukForever",
+        text: `Your order ${order.orderId} was delivered on ${latestStatus.strActionDate} at ${latestStatus.strActionTime}.\nPayment Method: ${order.paymentMethod}\nPayment Status: Paid`,
+      };
+      try {
         await transporter.sendMail(mailOptions);
-      } else if (order.paymentMethod === "PhonePe") {
-        const mailOptions = {
-          from: process.env.EMAIL_USER,
-          to: order.shippingAddress.email,
-          subject: "Order Delivered - MalukForever",
-          text: `Your order ${order.orderId} was delivered on ${latestStatus.strActionDate} at ${latestStatus.strActionTime}.\nPayment Method: PhonePe\nPayment Status: Paid`,
-        };
-        await transporter.sendMail(mailOptions);
+        console.log(`📧 Email - Sent delivery confirmation for order ${order.orderId}`);
+      } catch (emailError) {
+        console.error(`Failed to send delivery email for order ${order.orderId}:`, emailError.message);
       }
     }
 
     await order.save();
-    console.log(`Tracking updated for order ${order.orderId} with status ${order.status}, paymentStatus ${order.paymentStatus}`);
+    console.log(`✅ Tracking updated for order ${order.orderId} with status ${order.status}, paymentStatus ${order.paymentStatus}`);
 
     return res.status(200).json({ success: true, message: "DTDC tracking update received" });
   } catch (error) {
-    console.error("Tracking update error:", error.message);
+    console.error("❌ Tracking update error:", error.message, error.stack);
     return res.status(500).json({ success: false, error: "Internal server error" });
   }
 };
 
-// Cancel Order with Shipsy (unchanged)
-exports.cancelOrder = async (req, res) => {
+// Cancel an order with DTDC
+const cancelOrder = async (req, res) => {
   try {
     const { orderId } = req.params;
     const { reason } = req.body;
@@ -298,8 +298,8 @@ exports.cancelOrder = async (req, res) => {
   }
 };
 
-// Other shipping functions (unchanged)
-exports.getCities = async (req, res) => {
+// Get distinct cities
+const getCities = async (req, res) => {
   try {
     const cities = await ShippingDetails.distinct("city");
     res.status(200).json({ success: true, cities });
@@ -309,7 +309,8 @@ exports.getCities = async (req, res) => {
   }
 };
 
-exports.getStates = async (req, res) => {
+// Get distinct states
+const getStates = async (req, res) => {
   try {
     const states = await ShippingDetails.distinct("state");
     res.status(200).json({ success: true, states });
@@ -319,7 +320,8 @@ exports.getStates = async (req, res) => {
   }
 };
 
-exports.getPincodeDetails = async (req, res) => {
+// Get pincode details (city, state)
+const getPincodeDetails = async (req, res) => {
   try {
     const { pincode } = req.body;
     if (!pincode || pincode.length !== 6) {
@@ -334,27 +336,59 @@ exports.getPincodeDetails = async (req, res) => {
   }
 };
 
-exports.verifyPincode = async (req, res) => {
+// Verify pincode for serviceability and shipping cost
+const verifyPincode = async (req, res) => {
   try {
-    const { orgPincode, desPincode } = req.body;
-    if (!orgPincode || !desPincode) {
-      return res.status(400).json({ success: false, message: "Origin and destination pincodes are required" });
+    const { desPincode } = req.body;
+    console.log("Verifying pincode:", desPincode);
+    if (!desPincode) {
+      return res.status(400).json({ success: false, message: "Destination pincode is required" });
     }
 
     const shippingDetails = await ShippingDetails.findOne({ destinationPincode: desPincode });
+    console.log("Found details:", shippingDetails);
     if (!shippingDetails) {
-      return res.status(404).json({ success: false, message: "Destination pincode not found in database" });
+      return res.status(404).json({ success: false, message: "Pincode not found" });
     }
 
-    const isServiceable = !shippingDetails.serviceable || shippingDetails.serviceable.trim().toUpperCase() !== "NO";
+    const isServiceable =
+      shippingDetails.prepaid?.toUpperCase() === "Y" ||
+      shippingDetails.cod?.toUpperCase() === "Y" ||
+      shippingDetails.b2cCodServiceable?.toUpperCase() === "Y";
+    const isCodAvailable = shippingDetails.b2cCodServiceable?.toUpperCase() === "Y" && shippingDetails.cod?.toUpperCase() === "Y";
+    const isPrepaidAvailable = shippingDetails.prepaid?.toUpperCase() === "Y";
+
     if (!isServiceable) {
-      return res.status(200).json({ success: false, message: "Service not available for this pincode" });
+      return res.status(200).json({
+        success: false,
+        message: "Service not available for this pincode",
+      });
     }
+
+    // Map destinationCategory to shipping cost
+    const shippingCostMap = {
+      INCITY: 27,
+      "WITHIN REGION": 31,
+      "WITHIN ZONE": 35,
+      METRO: 40,
+      "ROI-A": 43,
+      "ROI-B": 48,
+      "SPL DEST": 53,
+    };
+
+    const destinationCategory = shippingDetails.destinationCategory?.toUpperCase();
+    const shippingCost = shippingCostMap[destinationCategory] || 53; // Default to SPL DEST
 
     res.status(200).json({
       success: true,
-      message: "*Service Available.",
-      shippingDetails: shippingDetails.toObject(),
+      message: "Service available",
+      isServiceable,
+      isCodAvailable,
+      isPrepaidAvailable,
+      city: shippingDetails.city,
+      state: shippingDetails.state,
+      shippingCost,
+      destinationCategory,
     });
   } catch (error) {
     console.error("Shipping - Error verifying pincode:", error.message);
@@ -364,10 +398,10 @@ exports.verifyPincode = async (req, res) => {
 
 module.exports = {
   bookShipment,
-  cancelOrder: exports.cancelOrder,
-  getCities: exports.getCities,
-  getStates: exports.getStates,
-  getPincodeDetails: exports.getPincodeDetails,
-  verifyPincode: exports.verifyPincode,
-  receiveTrackingUpdate: exports.receiveTrackingUpdate,
+  cancelOrder,
+  getCities,
+  getStates,
+  getPincodeDetails,
+  verifyPincode,
+  receiveTrackingUpdate,
 };

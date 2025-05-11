@@ -29,7 +29,7 @@ const orderSchema = new mongoose.Schema({
   shippingCost: { type: Number, default: 0 },
   couponCode: { type: String, default: null },
   discountAmount: { type: Number, default: 0 },
-  payableAmount: { type: Number, required: true, default: 0 }, // Final amount after discount (totalAmount + shippingCost - discountAmount)
+  payableAmount: { type: Number, required: true, default: 0 }, // Final amount after discount
   status: {
     type: String,
     enum: [
@@ -37,9 +37,12 @@ const orderSchema = new mongoose.Schema({
       'Pending Payment',  // Payment initiated but not completed
       'Processing',       // Payment successful, order being prepared
       'Shipped',          // Order dispatched
+      'Out for Delivery', // Order out for delivery
       'Delivered',        // Order delivered
       'Cancelled',        // Order cancelled
-      'Failed',           // Payment failed
+      'Failed',           // Delivery failed
+      'Return to Origin', // RTO initiated
+      'Returned',         // RTO completed
     ],
     default: 'Pending',
   },
@@ -51,15 +54,15 @@ const orderSchema = new mongoose.Schema({
     default: 'Pending',
   },
   paymentMethod: { type: String, required: true },
-  transactionId: { type: String }, // Optional: Store PhonePe transaction ID
+  transactionId: { type: String },
   cancellationRequested: { type: Boolean, default: false },
   cancellationReason: { type: String },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
-  reference_number: { type: String, default: '' }, // Added for Shipsy reference number
-  trackingUpdates: [ 
+  reference_number: { type: String, default: '' }, // Shipsy reference number
+  trackingUpdates: [
     {
-      action: { type: String }, // e.g., "BKD", "DLV", "NONDLV"
+      action: { type: String }, // e.g., "BKD", "DLV"
       actionDesc: { type: String }, // e.g., "Booked", "Delivered"
       origin: { type: String }, // Location name
       actionDate: { type: String }, // DDMMYYYY
@@ -70,10 +73,14 @@ const orderSchema = new mongoose.Schema({
       manifestNo: { type: String },
       scdOtp: { type: String }, // Y/N
       ndcOtp: { type: String }, // Y/N
-      trackingNumber: { type: String }, // Store DTDC/Shipsy shipment number
+      trackingNumber: { type: String }, // DTDC/Shipsy shipment number
       updatedAt: { type: Date, default: Date.now },
     },
   ],
+  weight: { type: String }, // From DTDC shipment.strWeight
+  rtoNumber: { type: String }, // From DTDC shipment.strRtoNumber
+  expectedDeliveryDate: { type: Date }, // From DTDC shipment.strExpectedDeliveryDate
+  revExpectedDeliveryDate: { type: Date }, // From DTDC shipment.strRevExpectedDeliveryDate
 });
 
 // Middleware to update `updatedAt` on save

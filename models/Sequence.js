@@ -5,4 +5,4 @@ const sequenceSchema = new mongoose.Schema({
   value: { type: Number, default: 0 },
 });
 
-module.exports = mongoose.models.Sequence || mongoose.model('Sequence', sequenceSchema);
+module.exports = mongoose.model('Sequence', sequenceSchema);

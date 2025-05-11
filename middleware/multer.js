@@ -13,21 +13,21 @@ const storage = multer.diskStorage({
 const fileFilter = (req, file, cb) => {
   const filetypes = /jpeg|jpg|png|gif/;
   const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
-  const mimetype = filetypes.test(file.mimetype) || file.mimetype.startsWith('image/');
+  const mimetype = filetypes.test(file.mimetype);
 
-  console.log('File details:', { originalname: file.originalname, mimetype: file.mimetype, extname, mimetypeCheck: filetypes.test(file.mimetype) });
+  console.log('File details:', { originalname: file.originalname, mimetype: file.mimetype, extname, mimetypeCheck: mimetype });
 
-  if (extname || mimetype) {
+  if (extname && mimetype) {
     cb(null, true);
   } else {
-    cb(new Error('Only images are allowed!'), false);
+    cb(new Error('Only images (JPEG, JPG, PNG, GIF) are allowed!'), false);
   }
 };
 
 const upload = multer({
   storage,
   fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
 }).fields([
   { name: 'thumbnails', maxCount: 2 },
   { name: 'gallery', maxCount: 5 },

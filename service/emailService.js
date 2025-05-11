@@ -1,113 +1,97 @@
 const nodemailer = require('nodemailer');
-const transporter = require("../config/nodemailer"); // Your nodemailer config
+const transporter = require("../config/nodemailer");
 require('dotenv').config();
 
-const sendOrderConfirmationEmail = async (orderId, recipientEmail, totalAmount, shippingCost, trackingNumber, transactionId = null, payableAmount) => {
-  const discount = totalAmount + shippingCost - payableAmount; // Calculate discount if any
+const sendOrderConfirmationEmail = async (
+  orderId,
+  recipientEmail,
+  totalAmount,
+  shippingCost,
+  trackingNumber,
+  transactionId = null,
+  payableAmount
+) => {
+  // Validate inputs
+  if (!recipientEmail || !orderId) {
+    throw new Error('Recipient email and order ID are required');
+  }
+
+  // Debug transporter
+  console.log('emailService - Transporter object:', transporter);
+  if (!transporter || typeof transporter.sendMail !== 'function') {
+    throw new Error('Transporter is not properly initialized');
+  }
+
+  const discount = totalAmount + shippingCost - payableAmount;
   const mailOptions = {
     from: `"MalukForever" <${process.env.EMAIL_USER}>`,
     to: recipientEmail,
     replyTo: process.env.EMAIL_USER,
     subject: `Order #${orderId} Confirmed - Thank You for Shopping with MalukForever!`,
     html: `
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Order Confirmation</title>
-      </head>
-      <body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4; color: #333;">
-        <table align="center" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; background-color: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin: 20px auto;">
-          <!-- Header -->
-          <tr>
-            <td bgcolor="#1a73e8" style="padding: 20px; text-align: center;">
-              <h1 style="color: #ffffff; margin: 0; font-size: 24px;">Order Confirmed!</h1>
-              <p style="color: #e0e7ff; margin: 5px 0 0; font-size: 14px;">Thank you for shopping with MalukForever</p>
-            </td>
-          </tr>
-          <!-- Body -->
-          <tr>
-            <td style="padding: 30px;">
-              <h2 style="font-size: 20px; margin: 0 0 15px; color: #1a73e8;">Hello Valued Customer,</h2>
-              <p style="font-size: 16px; line-height: 1.5; margin: 0 0 20px;">
-                Your order has been successfully confirmed${transactionId ? ' and paid via PhonePe' : ' with Cash on Delivery'}. We’re preparing your items for shipment, and you’ll receive them soon!
-              </p>
-              
-              <!-- Order Details -->
-              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f9fafb; border-radius: 8px; padding: 20px; margin-bottom: 20px;">
-                <tr>
-                  <td style="font-size: 16px; padding-bottom: 10px;">
-                    <strong>Order Number:</strong> #${orderId}
-                  </td>
-                </tr>
-                ${transactionId ? `
-                <tr>
-                  <td style="font-size: 16px; padding-bottom: 10px;">
-                    <strong>Transaction ID:</strong> ${transactionId}
-                  </td>
-                </tr>` : ''}
-                <tr>
-                  <td style="font-size: 16px; padding-bottom: 10px;">
-                    <strong>Subtotal:</strong> ₹${totalAmount.toFixed(2)}
-                  </td>
-                </tr>
-                <tr>
-                  <td style="font-size: 16px; padding-bottom: 10px;">
-                    <strong>Shipping Cost:</strong> ${shippingCost > 0 ? `₹${shippingCost.toFixed(2)}` : 'Free'}
-                  </td>
-                </tr>
-                ${discount > 0 ? `
-                <tr>
-                  <td style="font-size: 16px; padding-bottom: 10px;">
-                    <strong>Discount:</strong> -₹${discount.toFixed(2)}
-                  </td>
-                </tr>` : ''}
-                <tr>
-                  <td style="font-size: 16px; padding-bottom: 10px;">
-                    <strong>${transactionId ? 'Amount Paid' : 'Amount Payable on Delivery'}:</strong> ₹${payableAmount.toFixed(2)}
-                  </td>
-                </tr>
-                <tr>
-                  <td style="font-size: 16px;">
-                    <strong>Tracking Number:</strong> ${trackingNumber || 'Will be updated soon'}
-                  </td>
-                </tr>
-              </table>
-
-              <!-- Call to Action -->
-              <p style="font-size: 16px; line-height: 1.5; margin: 0 0 20px;">
-                Track your order status or explore more products on our website.
-              </p>
-              <table border="0" cellpadding="0" cellspacing="0" align="center">
-                <tr>
-                  <td bgcolor="#1a73e8" style="border-radius: 5px;">
-                    <a href="https://malukforever.com/my-account" style="display: inline-block; padding: 12px 24px; color: #ffffff; text-decoration: none; font-size: 16px; font-weight: bold;">View My Account</a>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          <!-- Footer -->
-          <tr>
-            <td bgcolor="#f9fafb" style="padding: 20px; text-align: center; font-size: 12px; color: #666;">
-              <p style="margin: 0 0 10px;">Need help? Contact us at <a href="mailto:${process.env.EMAIL_USER}" style="color: #1a73e8; text-decoration: none;">${process.env.EMAIL_USER}</a></p>
-              <p style="margin: 0;">© ${new Date().getFullYear()} MalukForever. All rights reserved.</p>
-            </td>
-          </tr>
-        </table>
-      </body>
-      </html>
+      <h2>Thank You for Your Order!</h2>
+      <p>Dear Customer,</p>
+      <p>Your order #${orderId} has been successfully placed.</p>
+      <h3>Order Summary</h3>
+      <ul>
+        <li><strong>Total Amount:</strong> ₹${totalAmount.toFixed(2)}</li>
+        <li><strong>Shipping Cost:</strong> ₹${shippingCost.toFixed(2)}</li>
+        <li><strong>Discount:</strong> ₹${discount.toFixed(2)}</li>
+        <li><strong>Payable Amount:</strong> ₹${payableAmount.toFixed(2)}</li>
+        <li><strong>Tracking Number:</strong> ${trackingNumber || 'N/A'}</li>
+        ${transactionId ? `<li><strong>Transaction ID:</strong> ${transactionId}</li>` : ''}
+      </ul>
+      <p>We will notify you once your order is shipped.</p>
+      <p>Thank you for shopping with us!</p>
+      <p>Best regards,<br>MalukForever Team</p>
+      <p>© ${new Date().getFullYear()} MalukForever</p>
     `,
   };
 
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`Order confirmation email sent to ${recipientEmail} for order #${orderId}${transactionId ? ` with transaction ID ${transactionId}` : ''}, payable amount: ₹${payableAmount}`);
+    console.log(`Order confirmation email sent to ${recipientEmail} for order #${orderId}`);
   } catch (error) {
     console.error('Error sending order confirmation email:', error);
     throw error;
   }
 };
 
-module.exports = { sendOrderConfirmationEmail };
+const sendCancellationRequestEmail = async (recipientEmail, orderId, reason) => {
+  // Validate inputs
+  if (!recipientEmail || !orderId) {
+    throw new Error('Recipient email and order ID are required');
+  }
+
+  // Debug transporter
+  console.log('emailService - Transporter object:', transporter);
+  if (!transporter || typeof transporter.sendMail !== 'function') {
+    throw new Error('Transporter is not properly initialized');
+  }
+
+  const mailOptions = {
+    from: `"MalukForever" <${process.env.EMAIL_USER}>`,
+    to: recipientEmail,
+    subject: `Order Cancellation Request Received - Order #${orderId}`,
+    html: `
+      <h2>Order Cancellation Request</h2>
+      <p>Dear Customer,</p>
+      <p>Your request to cancel order #${orderId} has been received.</p>
+      <p><strong>Reason:</strong> ${reason}</p>
+      <p>We will process your request soon and notify you of the outcome.</p>
+      <p>Thank you for choosing MalukForever.</p>
+      <p>Best regards,<br>MalukForever Team</p>
+      <p>© ${new Date().getFullYear()} MalukForever</p>
+    `,
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log(`Cancellation request email sent to ${recipientEmail} for order #${orderId}`);
+  } catch (error) {
+    console.error('Error sending cancellation request email:', error);
+    throw error;
+  }
+};
+
+module.exports = { sendOrderConfirmationEmail, sendCancellationRequestEmail };

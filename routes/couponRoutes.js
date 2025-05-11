@@ -7,7 +7,7 @@ const router = express.Router();
 // Create a coupon (Admin only)
 router.post('/add', authMiddleware, adminMiddleware, createCoupon);
 // Get All Coupons
-router.get('/', authMiddleware, adminMiddleware, getAllCoupon);
+router.get('/',  getAllCoupon);
 // edit Update Coupon //
 router.put('/:id', authMiddleware, adminMiddleware, editCoupon);
 // Status "active", inactive //

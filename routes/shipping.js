@@ -11,14 +11,15 @@ const {
   receiveTrackingUpdate,
 } = require("../controllers/shippingController");
 
-// Shipping Routes
-router.get("/cities", authMiddleware, getCities);
-router.post("/:orderId/cancel", authMiddleware, cancelOrder);
-router.get("/states", authMiddleware, getStates);
-router.post("/pincode-details", authMiddleware, getPincodeDetails);
-router.post("/verify-pincode", authMiddleware, verifyPincode);
-router.post("/book-shipment", authMiddleware, bookShipment);
-router.post("/tracking/update", authMiddleware, receiveTrackingUpdate);
+// Public Shipping Routes (no authentication required)
+router.get("/cities", getCities);
+router.get("/states", getStates);
+router.post("/pincode-details", getPincodeDetails);
+router.post("/verify-pincode", verifyPincode);
 
+// Protected Shipping Routes (require authentication)
+router.post("/:orderId/cancel", authMiddleware, cancelOrder);
+router.post("/book-shipment", authMiddleware, bookShipment);
+router.post("/tracking/update", receiveTrackingUpdate);
 
 module.exports = router;
