@@ -34,23 +34,48 @@ exports.getAllProducts = async (req, res) => {
   }
 };
 
-// Fetch single product by ID
+// Fetch single product by ID or slug
 exports.getProductById = async (req, res) => {
   try {
-    const productId = req.params.id;
+    // Determine if the request is for slug or ID based on parameter
+    const identifier = req.params.slug || req.params.id;
+    const isSlug = !!req.params.slug; // True for /slug/:slug, false for /:id
 
-    if (!mongoose.Types.ObjectId.isValid(productId)) {
-      return res.status(400).json({ error: 'Invalid product ID' });
+    if (!identifier) {
+      return res.status(400).json({
+        error: 'Missing identifier',
+        message: 'Product ID or slug is required',
+      });
     }
 
-    const product = await Product.findById(productId)
-      .populate('category')
-      .populate('subcategory')
-      .populate('reviews') // Populate reviews
-      .lean();
+    let product;
+    if (isSlug) {
+      console.log(`Fetching product by slug: ${identifier}`);
+      product = await Product.findOne({ slug: identifier })
+        .populate('category')
+        .populate('subcategory')
+        .populate('reviews')
+        .lean();
+    } else if (mongoose.Types.ObjectId.isValid(identifier)) {
+      console.log(`Fetching product by ID: ${identifier}`);
+      product = await Product.findById(identifier)
+        .populate('category')
+        .populate('subcategory')
+        .populate('reviews')
+        .lean();
+    } else {
+      return res.status(400).json({
+        error: 'Invalid identifier',
+        message: 'Provided ID is not a valid MongoDB ObjectId',
+      });
+    }
 
     if (!product || !product._id) {
-      return res.status(404).json({ error: 'Product not found' });
+      console.log(`Product not found for identifier: ${identifier} (isSlug: ${isSlug})`);
+      return res.status(404).json({
+        error: 'Product not found',
+        message: isSlug ? 'No product found with the given slug' : 'No product found with the given ID',
+      });
     }
 
     const formattedProduct = {
@@ -61,43 +86,66 @@ exports.getProductById = async (req, res) => {
       gallery: product.gallery.map(galleryItem =>
         galleryItem.startsWith('http') ? galleryItem : `${req.protocol}://${req.get('host')}/${galleryItem}`
       ),
-      salePrice: product.saleprice,
+      salePrice: product.saleprice || product.price, // Fallback to price if saleprice is undefined
     };
 
-    console.log('Fetched single product with normalized URLs:', formattedProduct);
+    console.log('Fetched single product with normalized URLs:', {
+      _id: formattedProduct._id,
+      slug: formattedProduct.slug,
+      name: formattedProduct.name,
+      thumbnails: formattedProduct.thumbnails,
+      salePrice: formattedProduct.salePrice,
+    });
     res.status(200).json(formattedProduct);
   } catch (err) {
-    console.error('Error fetching product:', err);
-    res.status(500).json({ error: 'Failed to fetch product' });
+    console.error('Error fetching product:', {
+      identifier: req.params.slug || req.params.id,
+      error: err.message,
+      stack: err.stack,
+    });
+    res.status(500).json({
+      error: 'Failed to fetch product',
+      message: err.message,
+    });
   }
 };
 
 // Get products by category
 exports.getProductsByCategory = async (req, res) => {
   try {
-    const categoryId = req.params.categoryId; // Use path parameter
-    const { subcategoryId } = req.query; // Optional query parameter
+    const { categorySlug } = req.params;
+    const { subcategoryId } = req.query;
 
-    if (!categoryId || !mongoose.Types.ObjectId.isValid(categoryId)) {
-      return res.status(400).json({ error: 'Invalid or missing category ID' });
+    // Validate categorySlug
+    if (!categorySlug || typeof categorySlug !== 'string' || categorySlug.trim() === '') {
+      return res.status(400).json({ error: 'Invalid or missing category slug' });
     }
 
-    const query = { category: categoryId };
+    const category = await Category.findOne({ slug: categorySlug });
+    if (!category) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+
+    let query = { category: category._id };
     if (subcategoryId) {
       if (!mongoose.Types.ObjectId.isValid(subcategoryId)) {
         return res.status(400).json({ error: 'Invalid subcategory ID' });
+      }
+      const subcategory = await Subcategory.findById(subcategoryId);
+      if (!subcategory) {
+        return res.status(404).json({ error: 'Subcategory not found' });
       }
       query.subcategory = subcategoryId;
     }
 
     const products = await Product.find(query)
-      .populate('category')
-      .populate('subcategory')
+      .populate('category', 'name slug')
+      .populate('subcategory', 'name')
       .populate('reviews')
       .lean();
 
     if (!products.length) {
-      return res.status(404).json({ message: 'No products found for this category' });
+      return res.status(200).json([]); // Return empty array instead of 404 for no products
     }
 
     const formattedProducts = products.map(product => ({
@@ -108,13 +156,16 @@ exports.getProductsByCategory = async (req, res) => {
       gallery: product.gallery.map(galleryItem =>
         galleryItem.startsWith('http') ? galleryItem : `${req.protocol}://${req.get('host')}/${galleryItem}`
       ),
-      salePrice: product.saleprice,
+      salePrice: product.saleprice || product.price,
     }));
 
     res.status(200).json(formattedProducts);
   } catch (err) {
     console.error('Error fetching products by category:', err);
-    res.status(500).json({ error: 'Failed to fetch products by category' });
+    if (err.name === 'CastError') {
+      return res.status(400).json({ error: 'Invalid category or subcategory ID format' });
+    }
+    res.status(500).json({ error: 'Failed to fetch products' });
   }
 };
 
@@ -132,12 +183,27 @@ exports.updateProduct = async (req, res) => {
       return res.status(404).json({ error: 'Product not found' });
     }
 
+    // Generate new slug if name is being updated
+    if (updateData.name && updateData.name !== existingProduct.name) {
+      const baseSlug = updateData.name.toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+      
+      let slug = baseSlug;
+      let counter = 1;
+      while (await Product.findOne({ slug, _id: { $ne: productId } })) {
+        slug = `${baseSlug}-${counter}`;
+        counter++;
+      }
+      updateData.slug = slug;
+    }
+
     const oldSubcategoryId = existingProduct.subcategory;
     const newSubcategoryId = updateData.subcategory;
 
     if (updateData.saleprice !== undefined) {
       updateData.saleprice = updateData.salePrice;
-      delete updateData.saleprice;
+      delete updateData.salePrice;
     } else if (updateData.saleprice !== undefined) {
       updateData.saleprice = updateData.saleprice;
     } else {
@@ -160,7 +226,7 @@ exports.updateProduct = async (req, res) => {
       productId,
       updateData,
       { new: true, runValidators: true }
-    ).populate('reviews'); // Populate reviews after update
+    ).populate('reviews');
 
     if (!updatedProduct) {
       return res.status(404).json({ error: 'Product not found' });
@@ -206,7 +272,10 @@ exports.updateProduct = async (req, res) => {
     });
   } catch (error) {
     console.error('Error updating product:', error);
-    res.status(500).json({ error: 'Failed to update product' });
+    res.status(500).json({ 
+      error: 'Failed to update product',
+      message: error.message 
+    });
   }
 };
 
@@ -234,6 +303,19 @@ exports.addProduct = async (req, res) => {
       if (!subcategory) return res.status(404).json({ error: 'Subcategory not found' });
     }
 
+    // Generate slug from name
+    const baseSlug = name.toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-') // Replace non-alphanumeric chars with hyphens
+      .replace(/^-+|-+$/g, ''); // Remove leading/trailing hyphens
+    
+    // Check if slug exists and append number if needed
+    let slug = baseSlug;
+    let counter = 1;
+    while (await Product.findOne({ slug })) {
+      slug = `${baseSlug}-${counter}`;
+      counter++;
+    }
+
     const thumbnails = req.files['thumbnails']
       ? req.files['thumbnails'].map(file => `${req.protocol}://${req.get('host')}/uploads/${file.filename}`)
       : [];
@@ -246,6 +328,7 @@ exports.addProduct = async (req, res) => {
 
     const product = new Product({
       name,
+      slug,
       description,
       price,
       saleprice: saleprice,
@@ -275,7 +358,10 @@ exports.addProduct = async (req, res) => {
     res.status(201).json(responseProduct);
   } catch (err) {
     console.error('Error adding product:', err);
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ 
+      error: err.message,
+      message: 'Failed to add product. Please check your input data.'
+    });
   }
 };
 

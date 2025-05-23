@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 
 const productSchema = new mongoose.Schema({
   name: { type: String, required: true },
+  slug: { type: String, required: true, unique: true },
   description: { type: String, required: true },
   price: { type: Number, required: true },
   saleprice: { type: Number, required: true }, // Fixed 'require' to 'required'
@@ -14,5 +15,8 @@ const productSchema = new mongoose.Schema({
   specifications: { type: String, default: '' }, 
   reviews: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Review' }],
 }, { timestamps: true });
+
+// Create index for slug field for faster queries
+productSchema.index({ slug: 1 });
 
 module.exports = mongoose.model('Product', productSchema);

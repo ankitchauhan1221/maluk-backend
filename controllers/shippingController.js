@@ -1,4 +1,5 @@
 const axios = require("axios");
+const crypto = require("crypto");
 const Order = require("../models/Order");
 const ShippingDetails = require("../models/ShippingDetails");
 const nodemailer = require("nodemailer");
@@ -7,11 +8,66 @@ const SHIPSY_API_KEY = process.env.SHIPSY_API_KEY;
 const SHIPSY_BOOK_SHIPMENT_URL = process.env.SHIPSY_BOOK_SHIPMENT_URL;
 const SHIPSY_CANCEL_SHIPMENT_URL = process.env.SHIPSY_CANCEL_SHIPMENT_URL;
 const SHIPSY_CUSTOMER_CODE = process.env.SHIPSY_CUSTOMER_CODE;
+const PHONEPE_CLIENT_ID = process.env.PHONEPE_CLIENT_ID;
+const PHONEPE_CLIENT_SECRET = process.env.PHONEPE_CLIENT_SECRET;
+const PHONEPE_CLIENT_VERSION = process.env.PHONEPE_CLIENT_VERSION;
+const PHONEPE_API_URL = process.env.NODE_ENV === "production" 
+  ? "https://api.phonepe.com/apis/identity-manager" 
+  : "https://api-preprod.phonepe.com/apis/identity-manager";
+const PHONEPE_PG_URL = process.env.NODE_ENV === "production" 
+  ? "https://api.phonepe.com/apis/pg" 
+  : "https://api-preprod.phonepe.com/apis/pg-sandbox";
+
+// Validate environment variables
+if (!PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET || !PHONEPE_CLIENT_VERSION) {
+  console.error("PhonePe - Missing required environment variables", {
+    clientId: PHONEPE_CLIENT_ID ? "Set" : "Missing",
+    clientSecret: PHONEPE_CLIENT_SECRET ? "Set" : "Missing",
+    clientVersion: PHONEPE_CLIENT_VERSION ? "Set" : "Missing",
+  });
+  throw new Error("PhonePe configuration missing");
+}
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
 });
+
+// Fetch PhonePe Auth Token
+async function fetchAuthToken(retry = false) {
+  const url = `${PHONEPE_API_URL}/v1/oauth/token`;
+  const params = new URLSearchParams({
+    client_id: PHONEPE_CLIENT_ID,
+    client_version: PHONEPE_CLIENT_VERSION,
+    client_secret: PHONEPE_CLIENT_SECRET,
+    grant_type: "client_credentials",
+  });
+
+  try {
+    console.log("PhonePe - Fetching auth token", { url, clientId: PHONEPE_CLIENT_ID });
+    const response = await axios.post(url, params, {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    console.log("PhonePe - Auth Token Response:", {
+      accessToken: response.data.access_token?.slice(0, 10) + "...",
+      expiresAt: response.data.expires_at,
+      scope: response.data.scope || "Not provided",
+      tokenType: response.data.token_type || "Not provided",
+    });
+    return {
+      accessToken: response.data.access_token,
+      expiresAt: response.data.expires_at,
+    };
+  } catch (error) {
+    console.error("PhonePe - Error fetching auth token:", {
+      message: error.message,
+      status: error.response?.status,
+      data: error.response?.data ? JSON.stringify(error.response.data, null, 2) : "No response data",
+      retryAttempt: retry,
+    });
+    throw new Error("Failed to fetch auth token");
+  }
+}
 
 // Book a shipment with DTDC
 const bookShipment = async (orderId, order) => {
@@ -225,64 +281,205 @@ const receiveTrackingUpdate = async (req, res) => {
   }
 };
 
-// Cancel an order with DTDC
+// Cancel an order with DTDC and initiate refund if applicable
 const cancelOrder = async (req, res) => {
   try {
     const { orderId } = req.params;
     const { reason } = req.body;
     const customerId = req.user?.id;
 
+    console.log(`Cancel Order Request: orderId=${orderId}, reason=${reason}, user=${req.user?.email}`);
+
+    // Find order
     const order = await Order.findOne({ orderId, customer: customerId });
     if (!order) {
+      console.log(`Order not found: orderId=${orderId}, customerId=${customerId}`);
       return res.status(404).json({ success: false, error: "Order not found or unauthorized" });
     }
 
-    if (["Delivered"].includes(order.status)) {
-      return res.status(400).json({ success: false, error: "Cannot cancel a delivered order" });
-    }
-    if (order.status === "Cancelled") {
-      return res.status(400).json({ success: false, error: "Order already cancelled" });
+    // Log order details
+    console.log("Order details:", {
+      orderId: order.orderId,
+      paymentMethod: order.paymentMethod,
+      status: order.status,
+      refundStatus: order.refundStatus,
+      totalAmount: order.totalAmount,
+      transactionId: order.transactionId,
+    });
+
+    // Validate order data
+    if (!order.paymentMethod || !order.status) {
+      console.error(`Invalid order data: orderId=${orderId}, paymentMethod=${order.paymentMethod}, status=${order.status}`);
+      return res.status(400).json({ success: false, error: "Invalid order data" });
     }
 
-    const latestTracking = order.trackingUpdates[order.trackingUpdates.length - 1];
-    if (latestTracking?.trackingNumber && order.status !== "Processing") {
-      const headers = { "api-key": SHIPSY_API_KEY, "Content-Type": "application/json" };
-      const payload = {
-        customer_code: SHIPSY_CUSTOMER_CODE,
-        awb_number: latestTracking.trackingNumber,
-        reason: reason || "Customer requested cancellation",
-      };
-      const response = await axios.post(SHIPSY_CANCEL_SHIPMENT_URL, payload, { headers });
-      if (!response.data.success) {
-        throw new Error(`Shipsy cancellation failed: ${response.data.message || "Unknown error"}`);
+    // Check cancellation eligibility
+    if (order.paymentMethod === "COD" && ["Shipped", "Out for Delivery", "Delivered"].includes(order.status)) {
+      console.log(`COD cancellation blocked: status=${order.status}`);
+      return res.status(400).json({ success: false, error: "COD orders cannot be cancelled after Processing" });
+    }
+
+    if (["Out for Delivery", "Delivered"].includes(order.status)) {
+      console.log(`Cancellation blocked: status=${order.status}`);
+      return res.status(400).json({ success: false, error: "Cannot cancel orders that are out for delivery or delivered" });
+    }
+
+    if (order.status === "Cancelled" || order.refundStatus !== "none") {
+      console.log(`Already cancelled or refunded: status=${order.status}, refundStatus=${order.refundStatus}`);
+      return res.status(400).json({ success: false, error: "Order already cancelled or refund processed" });
+    }
+
+    // Initialize refund variables
+    let refundAmount = 0;
+    let refundId = null;
+    const shippingCost = order.shippingCost || 50;
+
+    // Handle refund logic
+    if (order.paymentMethod === "PhonePe" && ["Pending", "Pending Payment", "Processing", "Shipped"].includes(order.status)) {
+      refundAmount = order.totalAmount;
+      console.log(`Initiating PhonePe refund: orderId=${orderId}, amount=${refundAmount}`);
+
+      // Validate PhonePe configuration
+      if (!PHONEPE_PG_URL || !PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET) {
+        console.error(`PhonePe refund failed: Missing configuration`, {
+          pgUrl: PHONEPE_PG_URL ? "Set" : "Missing",
+          clientId: PHONEPE_CLIENT_ID ? "Set" : "Missing",
+          clientSecret: PHONEPE_CLIENT_SECRET ? "Set" : "Missing",
+        });
+        return res.status(500).json({
+          success: false,
+          error: "PhonePe refund failed: Payment gateway configuration error",
+        });
+      }
+
+      // Validate transactionId
+      if (!order.transactionId) {
+        console.error(`PhonePe refund failed: Missing transactionId for orderId=${orderId}`);
+        return res.status(400).json({
+          success: false,
+          error: "PhonePe refund failed: Missing transaction ID",
+        });
+      }
+
+      try {
+        // Fetch PhonePe access token
+        let { accessToken } = await fetchAuthToken();
+        console.log("PhonePe - Using access token for refund:", accessToken ? "Valid" : "Missing");
+
+        // Generate PhonePe refund payload
+        const merchantRefundId = `REFUND-${orderId}-${Date.now()}`;
+        const payload = {
+          merchantRefundId,
+          originalMerchantOrderId: order.orderId,
+          amount: refundAmount * 100, // Convert to paise
+        };
+        const payloadString = Buffer.from(JSON.stringify(payload)).toString("base64");
+        const stringToHash = `${payloadString}/payments/v2/refund${PHONEPE_CLIENT_SECRET}`;
+        const xVerify = crypto.createHash("sha256").update(stringToHash).digest("hex") + "###1";
+
+        console.log("PhonePe - Refund payload:", JSON.stringify(payload, null, 2));
+        console.log("PhonePe - Payload string (base64):", payloadString);
+        console.log("PhonePe - X-VERIFY checksum:", xVerify);
+
+        let refundResponse;
+        try {
+          refundResponse = await axios.post(
+            `${PHONEPE_PG_URL}/payments/v2/refund`,
+            payload,
+            {
+              headers: {
+                "Content-Type": "application/json",
+                "X-VERIFY": xVerify,
+                "X-MERCHANT-ID": PHONEPE_CLIENT_ID,
+                Authorization: `Bearer ${accessToken}`, // Reverted to Bearer
+              },
+            }
+          );
+        } catch (firstAttemptError) {
+          if (firstAttemptError.response?.status === 401) {
+            console.warn("PhonePe - 401 on first refund attempt, retrying with fresh token");
+            // Retry with fresh token
+            accessToken = (await fetchAuthToken(true)).accessToken;
+            refundResponse = await axios.post(
+              `${PHONEPE_PG_URL}/payments/v2/refund`,
+              payload,
+              {
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-VERIFY": xVerify,
+                  "X-MERCHANT-ID": PHONEPE_CLIENT_ID,
+                  Authorization: `Bearer ${accessToken}`,
+                },
+              }
+            );
+          } else {
+            throw firstAttemptError;
+          }
+        }
+
+        console.log("PhonePe - Refund response:", JSON.stringify(refundResponse.data, null, 2));
+
+        if (!refundResponse.data || typeof refundResponse.data !== "object") {
+          throw new Error("Invalid refund response from PhonePe");
+        }
+
+        refundId = refundResponse.data.refundId || merchantRefundId;
+        console.log(`PhonePe refund initiated: refundId=${refundId}, amount=${refundAmount}`);
+      } catch (refundError) {
+        console.error(`PhonePe refund failed: orderId=${orderId}`, {
+          message: refundError.message,
+          status: refundError.response?.status,
+          data: refundError.response?.data ? JSON.stringify(refundError.response.data, null, 2) : 'No response data',
+          stack: refundError.stack,
+        });
+        return res.status(500).json({
+          success: false,
+          error: `PhonePe refund failed: ${refundError.message}`,
+          details: refundError.response?.data?.message || refundError.message,
+        });
+      }
+    } else if (order.paymentMethod === "COD") {
+      refundAmount = 0;
+      refundId = null;
+      console.log(`No refund for COD: orderId=${orderId}`);
+    } else {
+      console.warn(`Unsupported payment method: ${order.paymentMethod} for orderId=${orderId}`);
+      refundAmount = 0;
+      refundId = null;
+    }
+
+    // Update order
+    order.status = "Cancelled";
+    order.refundStatus = refundAmount > 0 ? "initiated" : "none";
+    order.refundAmount = refundAmount;
+    order.refundId = refundId;
+    order.cancellationReason = reason;
+    order.updatedAt = new Date();
+
+    await order.save();
+    console.log(`Order updated: orderId=${orderId}, status=Cancelled, refundAmount=${refundAmount}, refundId=${refundId}`);
+
+    // Notify Shipsy (if applicable)
+    if (order.trackingNumber) {
+      try {
+        await axios.post(
+          SHIPSY_CANCEL_SHIPMENT_URL,
+          { reference_number: order.trackingNumber },
+          { headers: { Authorization: `Bearer ${SHIPSY_API_KEY}` } }
+        );
+        console.log(`Shipsy cancellation notified: trackingNumber=${order.trackingNumber}`);
+      } catch (shipsyError) {
+        console.error(`Shipsy cancellation failed: ${shipsyError.message}`);
       }
     }
 
-    order.status = "Cancelled";
-    order.cancellationReason = reason || "Customer requested cancellation";
-    order.trackingUpdates.push({
-      action: "CAN",
-      actionDesc: "Cancelled by customer",
-      trackingNumber: latestTracking?.trackingNumber || "",
-      remarks: reason || "No reason provided",
-      actionDate: new Date().toISOString().split("T")[0].replace(/-/g, ""),
-      actionTime: new Date().toISOString().split("T")[1].split(".")[0].replace(/:/g, ""),
-    });
-
-    let refundNote = "";
-    if (order.paymentMethod === "PhonePe" && order.paymentStatus === "Paid") {
-      refundNote = "\nA refund will be processed to your PhonePe account shortly.";
+    // Send cancellation email
+    try {
+      await sendCancellationEmail(order.email, order, reason, refundAmount, refundId);
+      console.log(`Cancellation email sent to ${order.email}`);
+    } catch (emailError) {
+      console.error(`Email sending failed: ${emailError.message}`);
     }
-
-    await order.save();
-
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: order.shippingAddress.email,
-      subject: "Order Cancellation Confirmation - MalukForever",
-      text: `Your order ${orderId} has been cancelled.\nReason: ${order.cancellationReason}\nPayment Method: ${order.paymentMethod}\nPayment Status: ${order.paymentStatus}${refundNote}`,
-    };
-    await transporter.sendMail(mailOptions);
 
     return res.status(200).json({
       success: true,
@@ -290,13 +487,25 @@ const cancelOrder = async (req, res) => {
       orderId,
       paymentMethod: order.paymentMethod,
       paymentStatus: order.paymentStatus,
-      status: order.status,
+      refundStatus: order.refundStatus,
+      refundAmount,
+      refundId,
+      shippingCost,
+      totalAmount: order.totalAmount,
     });
   } catch (error) {
-    console.error("Cancel order error:", error.message, error.response?.data);
-    return res.status(500).json({ success: false, error: "Failed to cancel order", details: error.message });
+    console.error(`Cancel order error: orderId=${req.params.orderId}`, {
+      message: error.message,
+      stack: error.stack,
+    });
+    return res.status(500).json({
+      success: false,
+      error: "Failed to cancel order",
+      details: error.message || "Unknown error",
+    });
   }
 };
+
 
 // Get distinct cities
 const getCities = async (req, res) => {

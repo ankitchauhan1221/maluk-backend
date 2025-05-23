@@ -33,16 +33,8 @@ const orderSchema = new mongoose.Schema({
   status: {
     type: String,
     enum: [
-      'Pending',          // Order created, payment not initiated
-      'Pending Payment',  // Payment initiated but not completed
-      'Processing',       // Payment successful, order being prepared
-      'Shipped',          // Order dispatched
-      'Out for Delivery', // Order out for delivery
-      'Delivered',        // Order delivered
-      'Cancelled',        // Order cancelled
-      'Failed',           // Delivery failed
-      'Return to Origin', // RTO initiated
-      'Returned',         // RTO completed
+      'Pending', 'Pending Payment', 'Processing', 'Shipped', 'Out for Delivery',
+      'Delivered', 'Cancelled', 'Failed', 'Return to Origin', 'Returned',
     ],
     default: 'Pending',
   },
@@ -81,6 +73,13 @@ const orderSchema = new mongoose.Schema({
   rtoNumber: { type: String }, // From DTDC shipment.strRtoNumber
   expectedDeliveryDate: { type: Date }, // From DTDC shipment.strExpectedDeliveryDate
   revExpectedDeliveryDate: { type: Date }, // From DTDC shipment.strRevExpectedDeliveryDate
+  refundStatus: {
+    type: String,
+    enum: ['none', 'initiated', 'completed', 'failed'],
+    default: 'none',
+  },
+  refundId: { type: String }, // PhonePe-generated refund ID
+  refundAmount: { type: Number, default: 0 }, // Refund amount in rupees
 });
 
 // Middleware to update `updatedAt` on save

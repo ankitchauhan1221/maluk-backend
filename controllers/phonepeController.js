@@ -9,60 +9,91 @@ const PHONEPE_CLIENT_VERSION = process.env.PHONEPE_CLIENT_VERSION;
 const PHONEPE_API_URL = "https://api.phonepe.com/apis/identity-manager";
 const PHONEPE_PG_URL = "https://api.phonepe.com/apis/pg";
 
-async function generateUnique6DigitOrderId() {
+// Token caching
+let cachedToken = null;
+let tokenExpiresAt = null;
+
+exports.generateUnique6DigitOrderId = function () {
+  return new Promise((resolve, reject) => {
     const maxRetries = 10;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        const orderId = Math.floor(100000 + Math.random() * 900000).toString();
-        const existingOrder = await Order.findOne({ orderId });
-        if (!existingOrder) {
+    let attempt = 1;
+
+    function tryGenerate() {
+      if (attempt > maxRetries) {
+        Order.findOne()
+          .sort({ orderId: -1 })
+          .then((lastOrder) => {
+            let newOrderId = lastOrder && lastOrder.orderId ? (parseInt(lastOrder.orderId) + 1).toString() : "100000";
+            if (parseInt(newOrderId) > 999999) {
+              return reject(new Error("Order ID range exhausted. Please implement a new ID strategy."));
+            }
+            console.log(`PhonePe - Fallback to incremental orderId: ${newOrderId}`);
+            resolve(newOrderId);
+          })
+          .catch(reject);
+        return;
+      }
+
+      const orderId = Math.floor(100000 + Math.random() * 900000).toString();
+      Order.findOne({ orderId })
+        .then((existingOrder) => {
+          if (!existingOrder) {
             console.log(`PhonePe - Generated unique orderId: ${orderId}`);
-            return orderId;
-        }
-        console.log(`PhonePe - Collision detected for orderId: ${orderId}, retrying (${attempt}/${maxRetries})`);
+            resolve(orderId);
+          } else {
+            console.log(`PhonePe - Collision detected for orderId: ${orderId}, retrying (${attempt}/${maxRetries})`);
+            attempt++;
+            tryGenerate();
+          }
+        })
+        .catch(reject);
     }
-    const lastOrder = await Order.findOne().sort({ orderId: -1 });
-    let newOrderId = lastOrder && lastOrder.orderId ? (parseInt(lastOrder.orderId) + 1).toString() : "100000";
-    if (parseInt(newOrderId) > 999999) {
-        throw new Error("Order ID range exhausted. Please implement a new ID strategy.");
-    }
-    console.log(`PhonePe - Fallback to incremental orderId: ${newOrderId}`);
-    return newOrderId;
-}
 
-async function fetchAuthToken() {
-  const url = `${PHONEPE_API_URL}/v1/oauth/token`;
-  const params = new URLSearchParams({
-    client_id: PHONEPE_CLIENT_ID,
-    client_version: PHONEPE_CLIENT_VERSION,
-    client_secret: PHONEPE_CLIENT_SECRET,
-    grant_type: "client_credentials",
+    tryGenerate();
   });
+};
 
-  try {
-    const response = await axios.post(url, params, {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    });
-    console.log("PhonePe - Auth Token Response:", {
-      accessToken: response.data.access_token.slice(0, 10) + "...",
-      expiresAt: response.data.expires_at,
-    });
-    return {
-      accessToken: response.data.access_token,
-      expiresAt: response.data.expires_at,
-    };
-  } catch (error) {
-    console.error("PhonePe - Error fetching auth token:", {
-      message: error.message,
-      stack: error.stack,
-    });
-    if (error.response) {
-      console.error("PhonePe - Error Response:", JSON.stringify(error.response.data, null, 2));
+exports.fetchAuthToken = function () {
+  return new Promise((resolve, reject) => {
+    // Use cached token if valid
+    if (cachedToken && tokenExpiresAt && Date.now() < tokenExpiresAt - 60000) {
+      console.log("PhonePe - Using cached auth token");
+      return resolve({ accessToken: cachedToken, expiresAt: tokenExpiresAt });
     }
-    throw new Error("Failed to fetch auth token");
-  }
-}
 
-const validateOrderData = (body) => {
+    const url = `${PHONEPE_API_URL}/v1/oauth/token`;
+    const params = new URLSearchParams({
+      client_id: PHONEPE_CLIENT_ID,
+      client_version: PHONEPE_CLIENT_VERSION,
+      client_secret: PHONEPE_CLIENT_SECRET,
+      grant_type: "client_credentials",
+    });
+
+    axios
+      .post(url, params, {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      })
+      .then((response) => {
+        cachedToken = response.data.access_token;
+        tokenExpiresAt = response.data.expires_at * 1000; // Convert to milliseconds
+        console.log("PhonePe - Auth Token Response:", {
+          accessToken: cachedToken?.slice(0, 10) + "...",
+          expiresAt: tokenExpiresAt,
+        });
+        resolve({ accessToken: cachedToken, expiresAt: tokenExpiresAt });
+      })
+      .catch((error) => {
+        console.error("PhonePe - Error fetching auth token:", {
+          message: error.message,
+          response: error.response?.data,
+          status: error.response?.status,
+        });
+        reject(new Error(`Failed to fetch auth token: ${error.message}`));
+      });
+  });
+};
+
+exports.validateOrderData = function (body) {
   const requiredFields = [
     "products",
     "shippingAddress",
@@ -83,7 +114,7 @@ const validateOrderData = (body) => {
   }
 };
 
-exports.initiatePhonePePayment = async (req, res) => {
+exports.initiatePhonePePayment = function (req, res) {
   console.log("Backend - Entering initiatePhonePePayment");
   console.log("Backend - Request Body:", JSON.stringify(req.body, null, 2));
   console.log("Backend - req.user:", req.user);
@@ -109,125 +140,189 @@ exports.initiatePhonePePayment = async (req, res) => {
   const customerId = req.user.id;
 
   try {
-    validateOrderData(req.body);
-    const orderId = await generateUnique6DigitOrderId();
-    console.log(`Backend - Generated orderId: ${orderId}`);
+    exports.validateOrderData(req.body);
+    exports
+      .generateUnique6DigitOrderId()
+      .then((orderId) => {
+        console.log(`Backend - Generated orderId: ${orderId}`);
 
-    const payableAmount = Math.max(0, totalAmount + shippingCost - discountAmount);
+        const payableAmount = Math.max(0, totalAmount + shippingCost - discountAmount);
 
-    const order = new Order({
-      orderId,
-      customer: customerId,
-      products,
-      totalAmount,
-      shippingCost,
-      discountAmount,
-      shippingAddress,
-      billingAddress,
-      paymentMethod: "PhonePe",
-      status: "Pending Payment",
-      paymentStatus: "Initiated",
-      payableAmount,
-      couponCode,
-      saveAddress,
-    });
+        const order = new Order({
+          orderId,
+          customer: customerId,
+          products,
+          totalAmount,
+          shippingCost,
+          discountAmount,
+          shippingAddress,
+          billingAddress,
+          paymentMethod: "PhonePe",
+          status: "Pending Payment",
+          paymentStatus: "Initiated",
+          payableAmount,
+          couponCode,
+          saveAddress,
+        });
 
-    await order.save();
-    console.log("Backend - Order saved:", orderId);
+        order
+          .save()
+          .then(() => {
+            console.log("Backend - Order saved:", orderId);
 
-    const { accessToken } = await fetchAuthToken();
+            exports
+              .fetchAuthToken()
+              .then(({ accessToken }) => {
+                const payload = {
+                  merchantOrderId: orderId,
+                  amount: Math.round(payableAmount * 100),
+                  expireAfter: 1200,
+                  paymentFlow: {
+                    type: "PG_CHECKOUT",
+                    message: `Payment for order ${orderId}`,
+                    merchantUrls: {
+                      redirectUrl: `${process.env.BACKEND_URL}/api/phonepe/verify-phonepe?orderId=${orderId}`,
+                    },
+                  },
+                };
 
-    const payload = {
-      merchantOrderId: orderId,
-      amount: Math.round(payableAmount * 100),
-      expireAfter: 1200,
-      paymentFlow: {
-        type: "PG_CHECKOUT",
-        message: `Payment for order ${orderId}`,
-        merchantUrls: {
-          redirectUrl: `${process.env.BACKEND_URL}/api/phonepe/verify-phonepe?orderId=${orderId}`,
-        },
-      },
-    };
+                console.log("Backend - PhonePe Payload:", JSON.stringify(payload, null, 2));
 
-    console.log("Backend - PhonePe Payload:", JSON.stringify(payload, null, 2));
+                const url = `${PHONEPE_PG_URL}/checkout/v2/pay`;
+                axios
+                  .post(url, payload, {
+                    headers: {
+                      "Content-Type": "application/json",
+                      Authorization: `Bearer ${accessToken}`, // Fixed from O-Bearer
+                    },
+                  })
+                  .then((response) => {
+                    console.log("Backend - PhonePe Response:", JSON.stringify({
+                      orderId: response.data.orderId,
+                      state: response.data.state,
+                      redirectUrl: response.data.redirectUrl,
+                      expireAt: response.data.expireAt,
+                    }, null, 2));
 
-    const url = `${PHONEPE_PG_URL}/checkout/v2/pay`;
-    const response = await axios.post(url, payload, {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `O-Bearer ${accessToken}`,
-      },
-    });
-
-    console.log("Backend - PhonePe Response:", JSON.stringify({
-      orderId: response.data.orderId,
-      state: response.data.state,
-      redirectUrl: response.data.redirectUrl,
-      expireAt: response.data.expireAt,
-    }, null, 2));
-
-    const redirectUrl = response.data.redirectUrl;
-    if (redirectUrl) {
-      return res.status(200).json({ success: true, orderId, paymentUrl: redirectUrl });
-    }
-    throw new Error("No redirect URL received from PhonePe");
+                    const redirectUrl = response.data.redirectUrl;
+                    if (redirectUrl) {
+                      res.status(200).json({ success: true, orderId, paymentUrl: redirectUrl });
+                    } else {
+                      throw new Error("No redirect URL received from PhonePe");
+                    }
+                  })
+                  .catch((error) => {
+                    console.error("Backend - Axios error:", {
+                      message: error.message,
+                      response: error.response?.data,
+                      status: error.response?.status,
+                    });
+                    res.status(500).json({ success: false, error: error.message });
+                  });
+              })
+              .catch((error) => {
+                console.error("Backend - Fetch auth token error:", {
+                  message: error.message,
+                  response: error.response?.data,
+                  status: error.response?.status,
+                });
+                res.status(500).json({ success: false, error: error.message });
+              });
+          })
+          .catch((error) => {
+            console.error("Backend - Order save error:", {
+              message: error.message,
+              stack: error.stack,
+            });
+            res.status(500).json({ success: false, error: error.message });
+          });
+      })
+      .catch((error) => {
+        console.error("Backend - Generate orderId error:", {
+          message: error.message,
+          stack: error.stack,
+        });
+        res.status(500).json({ success: false, error: error.message });
+      });
   } catch (error) {
     console.error("Backend - Payment error:", {
       message: error.message,
       stack: error.stack,
     });
-    return res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 };
 
-exports.verifyPhonePePayment = async (orderId, retries = 10, delay = 3000) => {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
+exports.verifyPhonePePayment = function (orderId, retries = 10, delay = 3000) {
+  return new Promise((resolve, reject) => {
+    let attempt = 1;
+
+    function tryVerify() {
       console.log(`PhonePe - Verifying payment for orderId: ${orderId} (Attempt ${attempt}/${retries})`);
-      const { accessToken } = await fetchAuthToken();
-      const url = `${PHONEPE_PG_URL}/checkout/v2/order/${orderId}/status`;
+      exports
+        .fetchAuthToken()
+        .then(({ accessToken }) => {
+          const url = `${PHONEPE_PG_URL}/checkout/v2/order/${orderId}/status`;
 
-      const response = await axios.get(url, {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `O-Bearer ${accessToken}`,
-        },
-      });
+          axios
+            .get(url, {
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${accessToken}`, // Fixed from O-Bearer
+              },
+            })
+            .then((response) => {
+              console.log("PhonePe - Payment Status Response:", JSON.stringify({
+                state: response.data.state,
+                amount: response.data.amount,
+                transactionId: response.data.paymentDetails?.[0]?.transactionId,
+              }, null, 2));
 
-      console.log("PhonePe - Payment Status Response:", JSON.stringify({
-        state: response.data.state,
-        amount: response.data.amount,
-        transactionId: response.data.paymentDetails?.[0]?.transactionId,
-      }, null, 2));
-
-      const transactionId = response.data.paymentDetails?.[0]?.transactionId || orderId;
-      const result = {
-        success: response.data.state === "COMPLETED",
-        state: response.data.state,
-        transactionId: transactionId,
-        amount: response.data.amount / 100,
-      };
-      console.log("PhonePe - Payment verification result:", result);
-      return result;
-    } catch (error) {
-      console.error(`PhonePe - Error verifying payment (Attempt ${attempt}/${retries}):`, {
-        message: error.message,
-        stack: error.stack,
-      });
-      if (error.response) {
-        console.error("PhonePe - Error Response:", JSON.stringify(error.response.data, null, 2));
-      }
-      if (attempt === retries) {
-        console.error("PhonePe - Max retries reached for payment verification");
-        throw error;
-      }
-      await new Promise((resolve) => setTimeout(resolve, delay));
+              const transactionId = response.data.paymentDetails?.[0]?.transactionId || orderId;
+              const result = {
+                success: response.data.state === "COMPLETED",
+                state: response.data.state,
+                transactionId: transactionId,
+                amount: response.data.amount / 100,
+              };
+              console.log("PhonePe - Payment verification result:", result);
+              resolve(result);
+            })
+            .catch((error) => {
+              console.error(`PhonePe - Error verifying payment (Attempt ${attempt}/${retries}):`, {
+                message: error.message,
+                response: error.response?.data,
+                status: error.response?.status,
+              });
+              if (attempt === retries) {
+                console.error("PhonePe - Max retries reached for payment verification");
+                reject(error);
+              } else {
+                attempt++;
+                setTimeout(tryVerify, delay);
+              }
+            });
+        })
+        .catch((error) => {
+          console.error(`PhonePe - Fetch auth token error (Attempt ${attempt}/${retries}):`, {
+            message: error.message,
+            response: error.response?.data,
+            status: error.response?.status,
+          });
+          if (attempt === retries) {
+            reject(error);
+          } else {
+            attempt++;
+            setTimeout(tryVerify, delay);
+          }
+        });
     }
-  }
+
+    tryVerify();
+  });
 };
 
-exports.verifyPhonePePaymentCallback = async (req, res) => {
+exports.verifyPhonePePaymentCallback = function (req, res) {
   const { orderId } = req.query;
   console.log("PhonePe - Callback invoked with query:", req.query);
   console.log("PhonePe - Callback headers:", req.headers);
@@ -244,75 +339,132 @@ exports.verifyPhonePePaymentCallback = async (req, res) => {
       throw new Error("FRONTEND_URL is not defined in environment variables");
     }
 
-    const order = await Order.findOne({ orderId });
-    if (!order) {
-      console.error("PhonePe - Callback failed: Order not found for orderId:", orderId);
-      return res.redirect(`${process.env.FRONTEND_URL}/order-failure?orderId=${encodeURIComponent(orderId)}&error=OrderNotFound`);
-    }
+    Order.findOne({ orderId })
+      .then((order) => {
+        if (!order) {
+          console.error("PhonePe - Callback failed: Order not found for orderId:", orderId);
+          return res.redirect(`${process.env.FRONTEND_URL}/order-failure?orderId=${encodeURIComponent(orderId)}&error=OrderNotFound`);
+        }
 
-    const paymentVerified = await exports.verifyPhonePePayment(orderId);
-    console.log("PhonePe - Payment verification result:", paymentVerified);
+        exports
+          .verifyPhonePePayment(orderId)
+          .then((paymentVerified) => {
+            console.log("PhonePe - Payment verification result:", paymentVerified);
 
-    const payableAmount = Math.max(0, order.totalAmount + order.shippingCost - (order.discountAmount || 0));
+            const payableAmount = Math.max(0, order.totalAmount + order.shippingCost - (order.discountAmount || 0));
 
-    if (paymentVerified.success && paymentVerified.state === "COMPLETED") {
-      order.status = "Processing";
-      order.paymentStatus = "Paid";
-      order.transactionId = paymentVerified.transactionId;
-      console.log("PhonePe - Saving order update:", { orderId, status: order.status, paymentStatus: order.paymentStatus });
-      await order.save();
+            if (paymentVerified.success && paymentVerified.state === "COMPLETED") {
+              order.status = "Processing";
+              order.paymentStatus = "Paid";
+              order.transactionId = paymentVerified.transactionId;
+              console.log("PhonePe - Saving order update:", { orderId, status: order.status, paymentStatus: order.paymentStatus });
 
-      try {
-        const { trackingNumber } = await bookShipment(orderId, order);
-        order.trackingNumber = trackingNumber;
-        console.log("PhonePe - Saving tracking number:", { orderId, trackingNumber });
-        await order.save();
-      } catch (shipmentError) {
-        console.error("PhonePe - Shipment booking failed:", {
-          message: shipmentError.message,
-          stack: shipmentError.stack,
+              order
+                .save()
+                .then(() => {
+                  bookShipment(orderId, order)
+                    .then(({ trackingNumber }) => {
+                      order.trackingNumber = trackingNumber;
+                      console.log("PhonePe - Saving tracking number:", { orderId, trackingNumber });
+                      return order.save();
+                    })
+                    .catch((shipmentError) => {
+                      console.error("PhonePe - Shipment booking failed:", {
+                        message: shipmentError.message,
+                        stack: shipmentError.stack,
+                      });
+                    })
+                    .then(() => {
+                      sendOrderConfirmationEmail(
+                        orderId,
+                        order.shippingAddress.email,
+                        order.totalAmount,
+                        order.shippingCost,
+                        order.trackingNumber,
+                        paymentVerified.transactionId,
+                        payableAmount
+                      ).catch((emailError) => {
+                        console.error("PhonePe - Failed to send confirmation email:", {
+                          message: emailError.message,
+                          stack: emailError.stack,
+                        });
+                      });
+
+                      const redirectUrl = `${process.env.FRONTEND_URL}/order-confirmation?orderId=${encodeURIComponent(
+                        orderId
+                      )}&transactionId=${encodeURIComponent(paymentVerified.transactionId)}&status=success`;
+                      console.log(`PhonePe - Redirecting to: ${redirectUrl}`);
+                      res.redirect(redirectUrl);
+                    });
+                })
+                .catch((error) => {
+                  console.error("PhonePe - Order save error:", {
+                    message: error.message,
+                    stack: error.stack,
+                  });
+                  throw error;
+                });
+            } else if (paymentVerified.state === "FAILED") {
+              order.status = "Failed";
+              order.paymentStatus = "Failed";
+              order
+                .save()
+                .then(() => {
+                  console.log(`PhonePe - Order marked as failed: ${orderId}, PaymentStatus: ${order.paymentStatus}`);
+                  res.redirect(
+                    `${process.env.FRONTEND_URL}/order-failure?orderId=${encodeURIComponent(orderId)}&error=PaymentFailed&reason=${encodeURIComponent(
+                      paymentVerified.reason || "Payment failed"
+                    )}`
+                  );
+                })
+                .catch((error) => {
+                  console.error("PhonePe - Order save error:", {
+                    message: error.message,
+                    stack: error.stack,
+                  });
+                  throw error;
+                });
+            } else {
+              order.status = "Pending";
+              order.paymentStatus = "Pending";
+              order
+                .save()
+                .then(() => {
+                  console.log(`PhonePe - Order remains pending: ${orderId}, PaymentStatus: ${order.paymentStatus}`);
+                  const redirectUrl = `${process.env.FRONTEND_URL}/checkout?orderId=${encodeURIComponent(orderId)}&status=pending`;
+                  console.log(`PhonePe - Redirecting to: ${redirectUrl}`);
+                  res.redirect(redirectUrl);
+                })
+                .catch((error) => {
+                  console.error("PhonePe - Order save error:", {
+                    message: error.message,
+                    stack: error.stack,
+                  });
+                  throw error;
+                });
+            }
+          })
+          .catch((error) => {
+            console.error("PhonePe - Payment verification error:", {
+              message: error.message,
+              stack: error.stack,
+              orderId,
+            });
+            throw error;
+          });
+      })
+      .catch((error) => {
+        console.error("PhonePe - Error in callback:", {
+          message: error.message,
+          stack: error.stack,
+          orderId,
         });
-      }
-
-      await sendOrderConfirmationEmail(
-        orderId,
-        order.shippingAddress.email,
-        order.totalAmount,
-        order.shippingCost,
-        order.trackingNumber,
-        paymentVerified.transactionId,
-        payableAmount
-      ).catch((emailError) => {
-        console.error("PhonePe - Failed to send confirmation email:", {
-          message: emailError.message,
-          stack: emailError.stack,
-        });
+        const redirectUrl = `${process.env.FRONTEND_URL}/order-failure?orderId=${encodeURIComponent(
+          orderId
+        )}&error=${encodeURIComponent(error.message)}`;
+        console.log(`PhonePe - Redirecting to: ${redirectUrl}`);
+        res.redirect(redirectUrl);
       });
-
-      const redirectUrl = `${process.env.FRONTEND_URL}/order-confirmation?orderId=${encodeURIComponent(
-        orderId
-      )}&transactionId=${encodeURIComponent(paymentVerified.transactionId)}&status=success`;
-      console.log(`PhonePe - Redirecting to: ${redirectUrl}`);
-      return res.redirect(redirectUrl);
-    } else if (paymentVerified.state === "FAILED") {
-      order.status = "Failed";
-      order.paymentStatus = "Failed";
-      await order.save();
-      console.log(`PhonePe - Order marked as failed: ${orderId}, PaymentStatus: ${order.paymentStatus}`);
-      return res.redirect(
-        `${process.env.FRONTEND_URL}/order-failure?orderId=${encodeURIComponent(orderId)}&error=PaymentFailed&reason=${encodeURIComponent(
-          paymentVerified.reason || "Payment failed"
-        )}`
-      );
-    } else {
-      order.status = "Pending";
-      order.paymentStatus = "Pending";
-      await order.save();
-      console.log(`PhonePe - Order remains pending: ${orderId}, PaymentStatus: ${order.paymentStatus}`);
-      const redirectUrl = `${process.env.FRONTEND_URL}/checkout?orderId=${encodeURIComponent(orderId)}&status=pending`;
-      console.log(`PhonePe - Redirecting to: ${redirectUrl}`);
-      return res.redirect(redirectUrl);
-    }
   } catch (error) {
     console.error("PhonePe - Error in callback:", {
       message: error.message,
@@ -323,11 +475,11 @@ exports.verifyPhonePePaymentCallback = async (req, res) => {
       orderId
     )}&error=${encodeURIComponent(error.message)}`;
     console.log(`PhonePe - Redirecting to: ${redirectUrl}`);
-    return res.redirect(redirectUrl);
+    res.redirect(redirectUrl);
   }
 };
 
-exports.checkPaymentStatus = async (req, res) => {
+exports.checkPaymentStatus = function (req, res) {
   const { orderId } = req.query;
   console.log("PhonePe - Checking payment status for orderId:", orderId);
 
@@ -336,97 +488,252 @@ exports.checkPaymentStatus = async (req, res) => {
     return res.status(400).json({ success: false, error: "Order ID is required" });
   }
 
-  try {
-    const order = await Order.findOne({ orderId });
-    if (!order) {
-      console.error("PhonePe - Order not found for status check:", orderId);
-      return res.status(404).json({ success: false, error: "Order not found" });
-    }
-
-    const paymentVerified = await exports.verifyPhonePePayment(orderId);
-    console.log("PhonePe - Payment verification result:", paymentVerified);
-
-    const payableAmount = Math.max(0, order.totalAmount + order.shippingCost - (order.discountAmount || 0));
-
-    if (paymentVerified.success && paymentVerified.state === "COMPLETED") {
-      if (order.paymentStatus !== "Paid") {
-        order.status = "Processing";
-        order.paymentStatus = "Paid";
-        order.transactionId = paymentVerified.transactionId;
-
-        if (!order.trackingNumber) {
-          try {
-            const { trackingNumber } = await bookShipment(orderId, order);
-            order.trackingNumber = trackingNumber;
-            console.log("PhonePe - Assigned tracking number:", { orderId, trackingNumber });
-          } catch (shipmentError) {
-            console.error("PhonePe - Shipment booking failed in checkPaymentStatus:", {
-              message: shipmentError.message,
-              stack: shipmentError.stack,
-            });
-          }
-        }
-        await order.save();
-        console.log("PhonePe - Order updated in checkPaymentStatus:", {
-          orderId,
-          status: order.status,
-          paymentStatus: order.paymentStatus,
-        });
-
-        await sendOrderConfirmationEmail(
-          orderId,
-          order.shippingAddress.email,
-          order.totalAmount,
-          order.shippingCost,
-          order.trackingNumber,
-          paymentVerified.transactionId,
-          payableAmount
-        ).catch((emailError) => {
-          console.error("PhonePe - Failed to send confirmation email in checkPaymentStatus:", {
-            message: emailError.message,
-            stack: emailError.stack,
-          });
-        });
+  Order.findOne({ orderId })
+    .then((order) => {
+      if (!order) {
+        console.error("PhonePe - Order not found for status check:", orderId);
+        return res.status(404).json({ success: false, error: "Order not found" });
       }
 
-      return res.json({
-        success: true,
-        status: "success",
+      exports
+        .verifyPhonePePayment(orderId)
+        .then((paymentVerified) => {
+          console.log("PhonePe - Payment verification result:", paymentVerified);
+
+          const payableAmount = Math.max(0, order.totalAmount + order.shippingCost - (order.discountAmount || 0));
+
+          if (paymentVerified.success && paymentVerified.state === "COMPLETED") {
+            if (order.paymentStatus !== "Paid") {
+              order.status = "Processing";
+              order.paymentStatus = "Paid";
+              order.transactionId = paymentVerified.transactionId;
+
+              if (!order.trackingNumber) {
+                bookShipment(orderId, order)
+                  .then(({ trackingNumber }) => {
+                    order.trackingNumber = trackingNumber;
+                    console.log("PhonePe - Assigned tracking number:", { orderId, trackingNumber });
+                    return order.save();
+                  })
+                  .catch((shipmentError) => {
+                    console.error("PhonePe - Shipment booking failed in checkPaymentStatus:", {
+                      message: shipmentError.message,
+                      stack: shipmentError.stack,
+                    });
+                  })
+                  .then(() => {
+                    sendOrderConfirmationEmail(
+                      orderId,
+                      order.shippingAddress.email,
+                      order.totalAmount,
+                      order.shippingCost,
+                      order.trackingNumber,
+                      paymentVerified.transactionId,
+                      payableAmount
+                    ).catch((emailError) => {
+                      console.error("PhonePe - Failed to send confirmation email in checkPaymentStatus:", {
+                        message: emailError.message,
+                        stack: emailError.stack,
+                      });
+                    });
+                  });
+              }
+
+              order
+                .save()
+                .then(() => {
+                  console.log("PhonePe - Order updated in checkPaymentStatus:", {
+                    orderId,
+                    status: order.status,
+                    paymentStatus: order.paymentStatus,
+                  });
+
+                  res.json({
+                    success: true,
+                    status: "success",
+                    orderId,
+                    transactionId: paymentVerified.transactionId,
+                    trackingNumber: order.trackingNumber,
+                    redirectUrl: `${process.env.FRONTEND_URL}/order-confirmation?orderId=${encodeURIComponent(
+                      orderId
+                    )}&transactionId=${encodeURIComponent(paymentVerified.transactionId)}&status=success`,
+                  });
+                })
+                .catch((error) => {
+                  console.error("PhonePe - Order save error:", {
+                    message: error.message,
+                    stack: error.stack,
+                  });
+                  throw error;
+                });
+            } else {
+              res.json({
+                success: true,
+                status: "success",
+                orderId,
+                transactionId: paymentVerified.transactionId,
+                trackingNumber: order.trackingNumber,
+                redirectUrl: `${process.env.FRONTEND_URL}/order-confirmation?orderId=${encodeURIComponent(
+                  orderId
+                )}&transactionId=${encodeURIComponent(paymentVerified.transactionId)}&status=success`,
+              });
+            }
+          } else if (paymentVerified.state === "FAILED") {
+            order.status = "Failed";
+            order.paymentStatus = "Failed";
+            order
+              .save()
+              .then(() => {
+                console.log("PhonePe - Order marked as failed in checkPaymentStatus:", {
+                  orderId,
+                  paymentStatus: order.paymentStatus,
+                });
+                res.json({
+                  success: false,
+                  status: "failed",
+                  orderId,
+                  reason: paymentVerified.reason || "Payment failed",
+                });
+              })
+              .catch((error) => {
+                console.error("PhonePe - Order save error:", {
+                  message: error.message,
+                  stack: error.stack,
+                });
+                throw error;
+              });
+          } else {
+            console.log("PhonePe - Payment still pending in checkPaymentStatus:", { orderId });
+            res.json({
+              success: false,
+              status: "pending",
+              orderId,
+            });
+          }
+        })
+        .catch((error) => {
+          console.error("PhonePe - Payment verification error:", {
+            message: error.message,
+            response: error.response?.data,
+            status: error.response?.status,
+            orderId,
+          });
+          res.status(500).json({ success: false, error: error.message });
+        });
+    })
+    .catch((error) => {
+      console.error("PhonePe - Error checking payment status:", {
+        message: error.message,
+        stack: error.stack,
         orderId,
-        transactionId: paymentVerified.transactionId,
-        trackingNumber: order.trackingNumber,
-        redirectUrl: `${process.env.FRONTEND_URL}/order-confirmation?orderId=${encodeURIComponent(
-          orderId
-        )}&transactionId=${encodeURIComponent(paymentVerified.transactionId)}&status=success`,
       });
-    } else if (paymentVerified.state === "FAILED") {
-      order.status = "Failed";
-      order.paymentStatus = "Failed";
-      await order.save();
-      console.log("PhonePe - Order marked as failed in checkPaymentStatus:", {
-        orderId,
-        paymentStatus: order.paymentStatus,
-      });
-      return res.json({
-        success: false,
-        status: "failed",
-        orderId,
-        reason: paymentVerified.reason || "Payment failed",
-      });
-    } else {
-      console.log("PhonePe - Payment still pending in checkPaymentStatus:", { orderId });
-      return res.json({
-        success: false,
-        status: "pending",
-        orderId,
-      });
-    }
-  } catch (error) {
-    console.error("PhonePe - Error checking payment status:", {
-      message: error.message,
-      stack: error.stack,
-      orderId,
+      res.status(500).json({ success: false, error: error.message });
     });
-    return res.status(500).json({ success: false, error: error.message });
+};
+
+exports.checkRefundStatus = function (req, res) {
+  const { orderId } = req.query;
+  const customerId = req.user?.id;
+
+  if (!orderId) {
+    console.error("PhonePe - No orderId provided for refund status check");
+    return res.status(400).json({ success: false, error: "Order ID is required" });
   }
+
+  Order.findOne({ orderId, customer: customerId })
+    .then((order) => {
+      if (!order) {
+        console.error("PhonePe - Order not found for refund status check:", orderId);
+        return res.status(404).json({ success: false, error: "Order not found or unauthorized" });
+      }
+
+      if (order.refundStatus === "none" || !order.refundId) {
+        console.log(`PhonePe - No refund initiated for orderId: ${orderId}`);
+        return res.status(400).json({ success: false, error: "No refund initiated for this order" });
+      }
+
+      exports
+        .fetchAuthToken()
+        .then(({ accessToken }) => {
+          const statusApiUrl = `${PHONEPE_PG_URL}/payments/v2/refund/${order.refundId}/status`;
+
+          axios
+            .get(statusApiUrl, {
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${accessToken}`, // Reverted to Bearer
+                "X-MERCHANT-ID": PHONEPE_CLIENT_ID,
+              },
+            })
+            .then((response) => {
+              console.log("PhonePe - Refund Status Response:", JSON.stringify({
+                state: response.data.state,
+                amount: response.data.amount,
+                refundId: response.data.refundId,
+                errorCode: response.data.errorCode,
+              }, null, 2));
+
+              const { state, amount, refundId, errorCode } = response.data;
+
+              order.refundStatus = state === "COMPLETED" ? "completed" : state === "FAILED" ? "failed" : "initiated";
+              if (state === "COMPLETED") {
+                order.status = "Cancelled";
+              }
+
+              order
+                .save()
+                .then(() => {
+                  res.status(200).json({
+                    success: true,
+                    orderId,
+                    refundId,
+                    refundAmount: amount / 100,
+                    refundStatus: state,
+                    errorCode: errorCode || null,
+                  });
+                })
+                .catch((error) => {
+                  console.error("PhonePe - Order save error:", {
+                    message: error.message,
+                    stack: error.stack,
+                  });
+                  res.status(500).json({ success: false, error: "Failed to save refund status", details: error.message });
+                });
+            })
+            .catch((error) => {
+              console.error("PhonePe - Error checking refund status:", {
+                message: error.message,
+                response: error.response?.data,
+                status: error.response?.status,
+              });
+              res.status(500).json({ success: false, error: "Failed to check refund status", details: error.message });
+            });
+        })
+        .catch((error) => {
+          console.error("PhonePe - Fetch auth token error:", {
+            message: error.message,
+            response: error.response?.data,
+            status: error.response?.status,
+          });
+          res.status(500).json({ success: false, error: "Failed to fetch auth token", details: error.message });
+        });
+    })
+    .catch((error) => {
+      console.error("PhonePe - Error finding order:", {
+        message: error.message,
+        stack: error.stack,
+      });
+      res.status(500).json({ success: false, error: "Failed to check refund status", details: error.message });
+    });
+};
+
+module.exports = {
+  generateUnique6DigitOrderId: exports.generateUnique6DigitOrderId,
+  fetchAuthToken: exports.fetchAuthToken,
+  validateOrderData: exports.validateOrderData,
+  initiatePhonePePayment: exports.initiatePhonePePayment,
+  verifyPhonePePayment: exports.verifyPhonePePayment,
+  verifyPhonePePaymentCallback: exports.verifyPhonePePaymentCallback,
+  checkPaymentStatus: exports.checkPaymentStatus,
+  checkRefundStatus: exports.checkRefundStatus,
 };
